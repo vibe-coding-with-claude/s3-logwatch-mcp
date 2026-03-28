@@ -1,0 +1,112 @@
+# ========================================
+# OS
+# ========================================
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+
+# ========================================
+# IDE & Editor
+# ========================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# ========================================
+# Secrets & Credentials
+# ========================================
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+credentials.json
+secrets.json
+.secrets/
+*.secret
+.env.local
+.env.*.local
+
+# ========================================
+# Python (apps/)
+# ========================================
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+.venv/
+venv/
+
+# Test & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ========================================
+# Kotlin / Spring Boot / Gradle (services/backend/)
+# ========================================
+*.class
+*.log
+*.kotlin_module
+.kotlin/
+
+# Gradle build output
+.gradle/
+**/build/
+gradle-app.setting
+.gradletasknamecache
+
+# Gradle wrapper JAR은 커밋에 포함
+!gradle/wrapper/gradle-wrapper.jar
+!**/gradle/wrapper/gradle-wrapper.jar
+
+# ========================================
+# Node.js / TypeScript / Vite (services/frontend/)
+# ========================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Build outputs
+dist/
+
+# TypeScript
+*.tsbuildinfo
+
+# Cache
+.eslintcache
+.stylelintcache
+
+# ========================================
+# Terraform (infra/)
+# ========================================
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars.json
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraform.tfstate.lock.info
+.terraformrc
+terraform.rc
+
+# ========================================
+# Claude Code
+# ========================================
+# .claude/settings.local.json
