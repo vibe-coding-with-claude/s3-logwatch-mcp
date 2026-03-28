@@ -1,16 +1,13 @@
 /**
  * Mock 로그 데이터 생성 스크립트
  *
- * S3에 Hive Partitioning 구조로 mock 로그를 직접 업로드합니다.
+ * S3에 도메인별 경로 구조로 mock 로그를 직접 업로드합니다.
  * Firehose를 거치지 않고 직접 S3에 JSON 파일로 넣되,
  * Athena가 읽을 수 있도록 Glue 테이블의 SerDe에 맞는 포맷으로 저장합니다.
  *
- * 로그 종류 5가지 x 100개 = 500개 (총 합 500개 이하)
- *   - ERROR: payment, auth 도메인
- *   - WARN: order, auth 도메인
- *   - INFO: payment, order, user 도메인
- *   - DEBUG: user, notification 도메인
- *   - TRACE: notification 도메인
+ * 경로 구조: seungjae/{domain}/{year}/{month}/{day}/
+ * 도메인 5개 x 100건 = 500건:
+ *   - user(100건), order(100건), payment(100건), auth(100건), notification(100건)
  *
  * 실행: npx tsx scripts/seed-mock-logs.ts
  */
@@ -155,17 +152,22 @@ function generateTimestamp(daysAgo: number): string {
   return date.toISOString();
 }
 
-function generateLogs(
-  level: string,
+/**
+ * 도메인별로 로그를 생성합니다.
+ * 각 도메인에서 다양한 레벨의 로그가 나옵니다.
+ */
+function generateLogsForDomain(
+  domain: string,
   count: number
 ): LogEntry[] {
-  const template = LOG_TEMPLATES[level];
+  const levels = Object.keys(LOG_TEMPLATES);
+  const services = DOMAIN_SERVICES[domain];
   const logs: LogEntry[] = [];
 
   for (let i = 0; i < count; i++) {
-    const domain =
-      template.domains[Math.floor(Math.random() * template.domains.length)];
-    const services = DOMAIN_SERVICES[domain];
+    // 다양한 레벨을 랜덤으로 배분
+    const level = levels[Math.floor(Math.random() * levels.length)];
+    const template = LOG_TEMPLATES[level];
     const service = services[Math.floor(Math.random() * services.length)];
     const message =
       template.messages[Math.floor(Math.random() * template.messages.length)];
@@ -190,21 +192,18 @@ function generateLogs(
 // =============================================================
 
 /**
- * 로그를 Hive Partitioning 구조로 S3에 업로드합니다.
+ * 로그를 도메인별 경로 구조로 S3에 업로드합니다.
  *
- * 경로 형식:
- *   s3://bucket/logs/level=ERROR/domain=payment/year=2026/month=03/day=28/batch-001.json
+ * 새 경로 형식:
+ *   s3://bucket/seungjae/{domain}/{year}/{month}/{day}/mock-batch-xxx.json
  *
  * 왜 JSON Lines 포맷인가?
  * - Athena가 JSON SerDe (org.openx.data.jsonserde.JsonSerDe)로 읽을 수 있습니다.
  * - 한 줄에 하나의 JSON 객체 = 한 로그 레코드
  * - Glue 테이블의 InputFormat을 JSON으로 맞춰야 합니다.
- *
- * 참고: 실제 운영에서는 Firehose가 Parquet으로 변환하여 저장하지만,
- * mock 데이터는 빠른 테스트를 위해 JSON으로 직접 넣습니다.
  */
 async function uploadLogsToS3(logs: LogEntry[]): Promise<number> {
-  // 로그를 파티션별로 그룹핑
+  // 로그를 도메인/날짜별로 그룹핑
   const partitions = new Map<string, LogEntry[]>();
 
   for (const log of logs) {
@@ -213,7 +212,8 @@ async function uploadLogsToS3(logs: LogEntry[]): Promise<number> {
     const month = (date.getMonth() + 1).toString().padStart(2, "0");
     const day = date.getDate().toString().padStart(2, "0");
 
-    const key = `level=${log.level}/domain=${log.domain}/year=${year}/month=${month}/day=${day}`;
+    // 새 경로: {base_prefix}{domain}/{year}/{month}/{day}/
+    const key = `${config.s3.base_prefix}${log.domain}/${year}/${month}/${day}`;
     if (!partitions.has(key)) {
       partitions.set(key, []);
     }
@@ -222,15 +222,13 @@ async function uploadLogsToS3(logs: LogEntry[]): Promise<number> {
 
   let uploadedFiles = 0;
 
-  for (const [partitionKey, partitionLogs] of partitions) {
+  for (const [partitionPath, partitionLogs] of partitions) {
     // JSON Lines 포맷: 한 줄에 하나의 JSON 객체
-    // 파티션 키 필드(level, domain, year, month, day)는 경로에서 추론되므로
-    // 데이터에는 나머지 필드만 포함해도 되지만, 편의상 전체를 넣습니다.
     const jsonLines = partitionLogs
       .map((log) => JSON.stringify(log))
       .join("\n");
 
-    const s3Key = `${config.s3.prefix}${partitionKey}/mock-batch-${Date.now()}.json`;
+    const s3Key = `${partitionPath}/mock-batch-${Date.now()}.json`;
 
     await s3.send(
       new PutObjectCommand({
@@ -242,7 +240,7 @@ async function uploadLogsToS3(logs: LogEntry[]): Promise<number> {
     );
 
     uploadedFiles++;
-    console.log(`  ✅ ${s3Key} (${partitionLogs.length}건)`);
+    console.log(`  uploaded ${s3Key} (${partitionLogs.length} records)`);
   }
 
   return uploadedFiles;
@@ -269,45 +267,31 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // 로그 생성 (5종류 x 100개 = 500개)
-  const logCounts: Record<string, number> = {
-    ERROR: 100,
-    WARN: 100,
-    INFO: 100,
-    DEBUG: 100,
-    TRACE: 100,
-  };
+  // 로그 생성 (5개 도메인 x 100건 = 500건)
+  const domains = config.domains.map((d) => d.name);
+  const LOGS_PER_DOMAIN = 100;
 
   let totalLogs = 0;
   const allLogs: LogEntry[] = [];
 
-  for (const [level, count] of Object.entries(logCounts)) {
-    const logs = generateLogs(level, count);
+  for (const domain of domains) {
+    const logs = generateLogsForDomain(domain, LOGS_PER_DOMAIN);
     allLogs.push(...logs);
     totalLogs += logs.length;
-    console.log(`📝 ${level}: ${count}개 생성`);
+    console.log(`  ${domain}: ${logs.length} records generated`);
   }
 
-  console.log(`\n총 ${totalLogs}개 로그 생성 완료\n`);
+  console.log(`\nTotal ${totalLogs} logs generated\n`);
 
   // S3 업로드
   console.log("S3 업로드 시작...\n");
   const uploadedFiles = await uploadLogsToS3(allLogs);
 
-  console.log(`\n=== 완료 ===`);
-  console.log(`총 로그: ${totalLogs}개`);
-  console.log(`S3 파일: ${uploadedFiles}개 (파티션별 그룹핑)`);
-  console.log(`\n다음 단계:`);
-  console.log(`  1. Athena에서 쿼리 테스트:`);
-  console.log(
-    `     SELECT level, domain, count(*) as cnt FROM s3_logwatch.logs GROUP BY level, domain ORDER BY cnt DESC`
-  );
-  console.log(
-    `  2. 파티션 필터 테스트:`
-  );
-  console.log(
-    `     SELECT * FROM s3_logwatch.logs WHERE level='ERROR' AND domain='payment' LIMIT 10`
-  );
+  console.log(`\n=== Done ===`);
+  console.log(`Total logs: ${totalLogs}`);
+  console.log(`S3 files: ${uploadedFiles} (grouped by domain/date partition)`);
+  console.log(`\nPath structure: s3://${config.s3.bucket}/${config.s3.base_prefix}{domain}/{year}/{month}/{day}/`);
+  console.log(`\nNext: npx tsx scripts/test-athena-query.ts`);
 }
 
 main().catch((error: unknown) => {

@@ -178,8 +178,13 @@ async function step2_initInfra(): Promise<void> {
   // server 내부의 도구를 직접 호출할 수 없으므로,
   // AWS SDK를 직접 사용하여 init-infra의 결과를 검증합니다.
   const { S3Client, HeadBucketCommand } = await import("@aws-sdk/client-s3");
-  const { GlueClient, GetDatabaseCommand, GetTableCommand } = await import("@aws-sdk/client-glue");
-  const { AthenaClient, GetWorkGroupCommand } = await import("@aws-sdk/client-athena");
+  const {
+    AthenaClient,
+    GetWorkGroupCommand,
+    StartQueryExecutionCommand,
+    GetQueryExecutionCommand,
+    GetQueryResultsCommand,
+  } = await import("@aws-sdk/client-athena");
   const { FirehoseClient, DescribeDeliveryStreamCommand } = await import("@aws-sdk/client-firehose");
 
   const config = loadConfig();
@@ -187,6 +192,33 @@ async function step2_initInfra(): Promise<void> {
   logInfo(`리전: ${REGION}`);
   logInfo("init-infra가 이미 실행된 상태를 전제로 리소스 존재를 확인합니다.");
   logInfo("처음이라면 먼저 Claude Code에서 'init-infra 실행해줘'를 호출하세요.");
+
+  // Athena DDL 실행 + 결과 조회 헬퍼 (테이블 존재 확인용)
+  const athena = new AthenaClient({ region: REGION });
+
+  async function runAthenaQuery(sql: string): Promise<string[][]> {
+    const start = await athena.send(new StartQueryExecutionCommand({
+      QueryString: sql,
+      WorkGroup: config.athena.workgroup,
+      ResultConfiguration: { OutputLocation: config.athena.output_location },
+    }));
+    const queryId = start.QueryExecutionId!;
+    // 완료까지 폴링
+    while (true) {
+      await new Promise(r => setTimeout(r, 1000));
+      const status = await athena.send(new GetQueryExecutionCommand({ QueryExecutionId: queryId }));
+      const state = status.QueryExecution?.Status?.State;
+      if (state === "SUCCEEDED") break;
+      if (state === "FAILED" || state === "CANCELLED") {
+        throw new Error(`Athena 쿼리 실패: ${status.QueryExecution?.Status?.StateChangeReason}`);
+      }
+    }
+    // 결과 조회
+    const results = await athena.send(new GetQueryResultsCommand({ QueryExecutionId: queryId }));
+    return (results.ResultSet?.Rows ?? []).map(
+      row => (row.Data ?? []).map(d => d.VarCharValue ?? "")
+    );
+  }
 
   // S3 버킷 확인
   const s3 = new S3Client({ region: REGION });
@@ -197,21 +229,32 @@ async function step2_initInfra(): Promise<void> {
     throw new Error(`S3 버킷이 존재하지 않습니다: ${config.s3.bucket}. 먼저 init-infra를 실행하세요.`);
   }
 
-  // Glue 데이터베이스 확인
-  const glue = new GlueClient({ region: REGION });
+  // Athena 워크그룹 확인
   try {
-    await glue.send(new GetDatabaseCommand({ Name: "s3_logwatch" }));
-    logPass("Glue 데이터베이스 존재 확인: s3_logwatch");
+    await athena.send(new GetWorkGroupCommand({ WorkGroup: config.athena.workgroup }));
+    logPass(`Athena 워크그룹 존재 확인: ${config.athena.workgroup}`);
   } catch {
-    throw new Error("Glue 데이터베이스 s3_logwatch가 존재하지 않습니다. 먼저 init-infra를 실행하세요.");
+    throw new Error(
+      `Athena 워크그룹이 존재하지 않습니다: ${config.athena.workgroup}. 먼저 init-infra를 실행하세요.`
+    );
   }
 
-  // Glue 테이블 확인
+  // Athena SHOW TABLES로 테이블 존재 확인 (Glue SDK 대체)
+  // Athena에서 SHOW TABLES를 실행하면 Glue Data Catalog의 테이블 목록을 반환합니다
   try {
-    await glue.send(new GetTableCommand({ DatabaseName: "s3_logwatch", Name: "logs" }));
-    logPass("Glue 테이블 존재 확인: s3_logwatch.logs");
-  } catch {
-    throw new Error("Glue 테이블 s3_logwatch.logs가 존재하지 않습니다. 먼저 init-infra를 실행하세요.");
+    const rows = await runAthenaQuery("SHOW TABLES IN s3_logwatch");
+    // SHOW TABLES 결과의 첫 행은 헤더, 나머지 행이 테이블 이름
+    const tableNames = rows.slice(1).map(r => r[0]);
+    if (tableNames.includes("logs")) {
+      logPass("Athena 테이블 존재 확인: s3_logwatch.logs (SHOW TABLES로 검증)");
+    } else {
+      throw new Error("테이블 logs가 s3_logwatch 데이터베이스에 존재하지 않습니다. 먼저 init-infra를 실행하세요.");
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("테이블 logs가")) {
+      throw err;
+    }
+    throw new Error("Athena 데이터베이스/테이블 확인 실패. 먼저 init-infra를 실행하세요.");
   }
 
   // Firehose 스트림 확인
@@ -224,17 +267,6 @@ async function step2_initInfra(): Promise<void> {
   } catch {
     throw new Error(
       `Firehose 스트림이 존재하지 않습니다: ${config.firehose.delivery_stream}. 먼저 init-infra를 실행하세요.`
-    );
-  }
-
-  // Athena 워크그룹 확인
-  const athena = new AthenaClient({ region: REGION });
-  try {
-    await athena.send(new GetWorkGroupCommand({ WorkGroup: config.athena.workgroup }));
-    logPass(`Athena 워크그룹 존재 확인: ${config.athena.workgroup}`);
-  } catch {
-    throw new Error(
-      `Athena 워크그룹이 존재하지 않습니다: ${config.athena.workgroup}. 먼저 init-infra를 실행하세요.`
     );
   }
 }

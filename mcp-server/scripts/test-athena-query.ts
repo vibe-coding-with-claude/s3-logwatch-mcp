@@ -75,22 +75,29 @@ async function runQuery(sql: string): Promise<void> {
 }
 
 async function main() {
-  console.log("=== Athena 쿼리 테스트 ===");
+  console.log("=== Athena Query Tests (domain-based routing) ===");
 
-  // 테스트 1: 레벨/도메인별 집계
+  // Test 1: domain별 집계
   await runQuery(
-    "SELECT level, domain, count(*) as cnt FROM s3_logwatch.logs GROUP BY level, domain ORDER BY cnt DESC"
+    "SELECT domain, count(*) as cnt FROM s3_logwatch.logs GROUP BY domain ORDER BY cnt DESC"
   );
 
-  // 테스트 2: 파티션 필터 (ERROR + payment)
+  // Test 2: 특정 domain 조회 (user)
   await runQuery(
-    "SELECT timestamp, service, message FROM s3_logwatch.logs WHERE level='ERROR' AND domain='payment' LIMIT 5"
+    "SELECT timestamp, level, service, message FROM s3_logwatch.logs WHERE domain='user' LIMIT 5"
   );
 
-  // 테스트 3: 전체 카운트
-  await runQuery("SELECT count(*) as total FROM s3_logwatch.logs");
+  // Test 3: domain + level 집계 (payment)
+  await runQuery(
+    "SELECT domain, level, count(*) as cnt FROM s3_logwatch.logs WHERE domain='payment' GROUP BY domain, level ORDER BY cnt DESC"
+  );
 
-  console.log("\n=== 테스트 완료 ===\n");
+  // Test 4: domain + 날짜 파티션 필터 (order, 2026-03)
+  await runQuery(
+    "SELECT count(*) as total FROM s3_logwatch.logs WHERE domain='order' AND year='2026' AND month='03'"
+  );
+
+  console.log("\n=== Tests complete ===\n");
 }
 
 main().catch((err) => {
