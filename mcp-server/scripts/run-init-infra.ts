@@ -207,7 +207,7 @@ async function main() {
     const createResp = await iam.send(new CreateRoleCommand({
       RoleName: FIREHOSE_ROLE_NAME,
       AssumeRolePolicyDocument: JSON.stringify(trustPolicy),
-      Description: "s3-logwatch: Firehose가 S3에 로그를 쓰고 Glue 스키마를 조회하기 위한 역할",
+      Description: "s3-logwatch: Firehose role for S3 write and Glue read access",
     }));
     roleArn = createResp.Role?.Arn;
 
@@ -295,7 +295,8 @@ async function main() {
         ErrorOutputPrefix: `${config.s3.base_prefix}errors/`,
         BufferingHints: {
           IntervalInSeconds: config.firehose.buffer_interval,
-          SizeInMBs: config.firehose.buffer_size,
+          // Dynamic Partitioning 사용 시 최소 64MB 필요
+          SizeInMBs: Math.max(config.firehose.buffer_size, 64),
         },
         // JSON 원본을 그대로 저장 (Parquet 변환 비활성화)
         CompressionFormat: "UNCOMPRESSED",

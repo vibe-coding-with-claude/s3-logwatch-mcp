@@ -778,7 +778,8 @@ async function createFirehoseStream(
           // 버퍼링 설정: 이 조건 중 하나라도 충족되면 S3에 파일을 씁니다
           BufferingHints: {
             IntervalInSeconds: config.firehose.buffer_interval,
-            SizeInMBs: config.firehose.buffer_size,
+            // Dynamic Partitioning 사용 시 최소 64MB 필요
+            SizeInMBs: Math.max(config.firehose.buffer_size, 64),
           },
           // 압축: JSON 원본을 그대로 저장하므로 UNCOMPRESSED
           CompressionFormat: "UNCOMPRESSED",
