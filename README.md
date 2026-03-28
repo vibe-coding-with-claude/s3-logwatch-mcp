@@ -210,6 +210,114 @@ domains:
     s3_prefix: seungjae/billing/
 ```
 
+## Athena DDL & Partition Projection
+
+`init-infra` 실행 시 Athena DDL로 테이블이 자동 생성됩니다. Glue SDK 없이 Athena만으로 관리합니다.
+
+### 생성되는 DDL
+
+```sql
+CREATE EXTERNAL TABLE IF NOT EXISTS s3_logwatch.logs (
+  timestamp string,
+  level string,
+  service string,
+  message string,
+  trace_id string
+)
+PARTITIONED BY (domain string, year string, month string, day string)
+ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
+WITH SERDEPROPERTIES ('case.insensitive' = 'true')
+LOCATION 's3://s3-logwatch-logs/seungjae/'
+TBLPROPERTIES (
+  'projection.enabled'        = 'true',
+  'projection.domain.type'    = 'enum',
+  'projection.domain.values'  = 'user,order,payment,auth,notification',
+  'projection.year.type'      = 'integer',
+  'projection.year.range'     = '2024,2030',
+  'projection.month.type'     = 'integer',
+  'projection.month.range'    = '1,12',
+  'projection.month.digits'   = '2',
+  'projection.day.type'       = 'integer',
+  'projection.day.range'      = '1,31',
+  'projection.day.digits'     = '2',
+  'storage.location.template' = 's3://s3-logwatch-logs/seungjae/${domain}/${year}/${month}/${day}/'
+)
+```
+
+### Partition Projection이란?
+
+일반적으로 S3에 새 파티션(폴더)이 생기면 `MSCK REPAIR TABLE`을 실행해야 Athena가 인식합니다. Partition Projection은 이 과정을 없앱니다.
+
+```
+기존 방식:
+  S3에 새 폴더 생성 → MSCK REPAIR TABLE 수동 실행 → Athena 인식
+
+Partition Projection:
+  S3에 새 폴더 생성 → Athena가 규칙 기반으로 자동 인식 (즉시)
+```
+
+### 쿼리 시 동작 원리
+
+```
+쿼리: SELECT * FROM logs WHERE domain='payment' AND year='2026' AND month='03' AND day='28'
+
+Athena가 storage.location.template에 값을 대입:
+  → s3://s3-logwatch-logs/seungjae/payment/2026/03/28/
+
+이 경로의 JSON 파일만 스캔 → 비용 최소화
+```
+
+| 쿼리 유형 | 스캔 범위 | 비용 |
+|---|---|---|
+| `WHERE domain='payment'` | payment 폴더만 | ~0.02 MB |
+| `WHERE domain='payment' AND year='2026' AND month='03' AND day='28'` | 하루치만 | ~0.01 MB |
+| 조건 없이 전체 스캔 | 모든 도메인 × 모든 날짜 | ~0.09 MB |
+
+### Projection 설정 항목 설명
+
+| 설정 | 의미 |
+|---|---|
+| `projection.enabled = true` | 파티션 자동 추론 ON |
+| `projection.domain.type = enum` | 고정 목록에서 매칭 (config.domains에서 동적 생성) |
+| `projection.year.type = integer` | 2024~2030 범위 자동 생성 |
+| `projection.month.digits = 2` | 01, 02, ... 12 (2자리 패딩) |
+| `storage.location.template` | 파티션 값 → S3 경로 변환 규칙 |
+
+### 왜 Glue SDK 대신 Athena DDL인가?
+
+| | Glue SDK | Athena DDL |
+|---|---|---|
+| 의존성 | `@aws-sdk/client-glue` 필요 | 불필요 (Athena SDK만) |
+| 테이블 생성 | CreateTableCommand (복잡) | SQL 한 줄 |
+| 도메인 추가 | Glue API로 테이블 업데이트 | `ALTER TABLE` 한 줄 |
+| 내부 동작 | Glue Data Catalog 직접 조작 | DDL → Glue Catalog 자동 등록 |
+
+Athena에서 DDL을 실행하면 내부적으로 Glue Data Catalog에 자동 등록됩니다. 코드에서 Glue를 직접 호출할 필요가 없습니다.
+
+### 로그 JSON 구조
+
+S3에 저장되는 각 로그 한 건의 형식:
+
+```json
+{
+  "timestamp": "2026-03-28T14:23:45.873Z",
+  "level": "ERROR",
+  "domain": "payment",
+  "service": "payment-api",
+  "message": "Connection timeout to payment gateway",
+  "trace_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+}
+```
+
+| 필드 | 타입 | 설명 |
+|---|---|---|
+| `timestamp` | string | ISO 8601 형식 |
+| `level` | string | ERROR, WARN, INFO, DEBUG, TRACE |
+| `domain` | string (파티션) | 도메인명 — S3 경로로 분기됨 |
+| `service` | string | 서비스명 (예: payment-api, auth-gateway) |
+| `message` | string | 로그 메시지 |
+| `trace_id` | string | 추적 ID (UUID) |
+
 ## 프로젝트 구조
 
 ```
@@ -457,6 +565,114 @@ domains:
   - name: billing
     s3_prefix: seungjae/billing/
 ```
+
+## Athena DDL & Partition Projection
+
+`init-infra` creates the table via Athena DDL. No Glue SDK needed.
+
+### Generated DDL
+
+```sql
+CREATE EXTERNAL TABLE IF NOT EXISTS s3_logwatch.logs (
+  timestamp string,
+  level string,
+  service string,
+  message string,
+  trace_id string
+)
+PARTITIONED BY (domain string, year string, month string, day string)
+ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
+WITH SERDEPROPERTIES ('case.insensitive' = 'true')
+LOCATION 's3://s3-logwatch-logs/seungjae/'
+TBLPROPERTIES (
+  'projection.enabled'        = 'true',
+  'projection.domain.type'    = 'enum',
+  'projection.domain.values'  = 'user,order,payment,auth,notification',
+  'projection.year.type'      = 'integer',
+  'projection.year.range'     = '2024,2030',
+  'projection.month.type'     = 'integer',
+  'projection.month.range'    = '1,12',
+  'projection.month.digits'   = '2',
+  'projection.day.type'       = 'integer',
+  'projection.day.range'      = '1,31',
+  'projection.day.digits'     = '2',
+  'storage.location.template' = 's3://s3-logwatch-logs/seungjae/${domain}/${year}/${month}/${day}/'
+)
+```
+
+### What is Partition Projection?
+
+Normally, when new partitions (folders) appear in S3, you must run `MSCK REPAIR TABLE` for Athena to recognize them. Partition Projection eliminates this step.
+
+```
+Traditional:
+  New S3 folder → MSCK REPAIR TABLE (manual) → Athena recognizes it
+
+Partition Projection:
+  New S3 folder → Athena recognizes it instantly (rule-based)
+```
+
+### How Queries Work
+
+```
+Query: SELECT * FROM logs WHERE domain='payment' AND year='2026' AND month='03' AND day='28'
+
+Athena substitutes values into storage.location.template:
+  → s3://s3-logwatch-logs/seungjae/payment/2026/03/28/
+
+Only scans JSON files in this path → minimal cost
+```
+
+| Query Type | Scan Scope | Cost |
+|---|---|---|
+| `WHERE domain='payment'` | payment folder only | ~0.02 MB |
+| `WHERE domain='payment' AND year='2026' AND month='03' AND day='28'` | single day | ~0.01 MB |
+| No filter (full scan) | all domains x all dates | ~0.09 MB |
+
+### Projection Settings
+
+| Setting | Meaning |
+|---|---|
+| `projection.enabled = true` | Auto partition discovery ON |
+| `projection.domain.type = enum` | Match from fixed list (dynamic from config.domains) |
+| `projection.year.type = integer` | Auto-generate range 2024-2030 |
+| `projection.month.digits = 2` | Zero-padded: 01, 02, ... 12 |
+| `storage.location.template` | Partition values → S3 path mapping rule |
+
+### Why Athena DDL instead of Glue SDK?
+
+| | Glue SDK | Athena DDL |
+|---|---|---|
+| Dependency | `@aws-sdk/client-glue` required | Not needed (Athena SDK only) |
+| Table creation | CreateTableCommand (complex) | Single SQL statement |
+| Add domain | Glue API table update | `ALTER TABLE` one-liner |
+| Internal | Directly manipulates Glue Catalog | DDL → auto-registers in Glue Catalog |
+
+Running DDL in Athena automatically registers the table in Glue Data Catalog. No need to call Glue directly from code.
+
+### Log JSON Structure
+
+Each log record stored in S3:
+
+```json
+{
+  "timestamp": "2026-03-28T14:23:45.873Z",
+  "level": "ERROR",
+  "domain": "payment",
+  "service": "payment-api",
+  "message": "Connection timeout to payment gateway",
+  "trace_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `timestamp` | string | ISO 8601 format |
+| `level` | string | ERROR, WARN, INFO, DEBUG, TRACE |
+| `domain` | string (partition) | Domain name — routes to S3 path |
+| `service` | string | Service name (e.g. payment-api, auth-gateway) |
+| `message` | string | Log message |
+| `trace_id` | string | Trace ID (UUID) |
 
 ## Project Structure
 
