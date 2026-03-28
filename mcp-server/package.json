@@ -1,0 +1,27 @@
+{
+  "name": "s3-logwatch",
+  "version": "0.1.0",
+  "description": "S3 + Athena 기반 로그 분석 MCP Server - Claude Code에서 자연어로 로그를 분석합니다",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "e2e": "tsx scripts/e2e-test.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@aws-sdk/client-s3": "^3.700.0",
+    "@aws-sdk/client-athena": "^3.700.0",
+    "@aws-sdk/client-firehose": "^3.700.0",
+    "@aws-sdk/client-glue": "^3.700.0",
+    "@aws-sdk/client-iam": "^3.700.0",
+    "@aws-sdk/client-cloudwatch-logs": "^3.700.0",
+    "yaml": "^2.7.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0",
+    "tsx": "^4.19.0",
+    "@types/node": "^22.10.0"
+  }
+}

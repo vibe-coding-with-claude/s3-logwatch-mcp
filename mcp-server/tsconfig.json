@@ -1,0 +1,70 @@
+{
+  // ============================================================
+  // tsconfig.json - TypeScript 컴파일러 설정
+  // ============================================================
+  // TypeScript 코드를 JavaScript로 변환할 때 어떤 규칙을 적용할지 정의합니다.
+  // 이 파일이 없으면 TypeScript는 기본 설정으로 동작하는데,
+  // 프로젝트마다 필요한 설정이 다르므로 명시적으로 작성합니다.
+  // ============================================================
+
+  "compilerOptions": {
+    // -- 출력 설정 --
+
+    // 컴파일된 JS 파일이 저장되는 디렉토리
+    // src/index.ts -> dist/index.js 로 변환됩니다
+    "outDir": "dist",
+
+    // ES2022: 최신 JS 문법을 사용합니다 (top-level await, class fields 등)
+    // Node.js 18+ 에서 네이티브로 지원하므로 불필요한 변환이 없습니다
+    "target": "ES2022",
+
+    // -- 모듈 시스템 설정 --
+
+    // Node16: Node.js의 ESM (ES Modules) 시스템을 사용합니다
+    // package.json의 "type": "module"과 짝을 이루어야 합니다
+    // ESM을 쓰는 이유: MCP SDK가 ESM으로 배포되므로 호환성을 맞춥니다
+    "module": "Node16",
+
+    // Node16: import 경로를 Node.js 방식으로 해석합니다
+    // 예) "./tools/init.js" 처럼 확장자를 명시해야 합니다
+    "moduleResolution": "Node16",
+
+    // -- 타입 안전성 설정 --
+
+    // strict 모드: 모든 엄격한 타입 체크를 켭니다
+    // - null/undefined 실수 방지 (strictNullChecks)
+    // - 암시적 any 타입 금지 (noImplicitAny)
+    // - this 타입 강제 (noImplicitThis)
+    // 처음에는 번거롭지만, 런타임 에러를 컴파일 타임에 잡아줍니다
+    "strict": true,
+
+    // 사용하지 않는 지역 변수가 있으면 에러 (코드 정리에 도움)
+    "noUnusedLocals": true,
+
+    // 사용하지 않는 함수 매개변수가 있으면 에러
+    "noUnusedParameters": true,
+
+    // -- 기타 설정 --
+
+    // .d.ts 선언 파일 생성 (라이브러리로 배포할 때 필요)
+    "declaration": true,
+
+    // import 시 ESM <-> CommonJS 호환성 개선
+    "esModuleInterop": true,
+
+    // 파일 이름 대소문자를 OS와 관계없이 일관되게 처리
+    "forceConsistentCasingInFileNames": true,
+
+    // import한 모듈의 타입을 더 정확하게 해석
+    "resolveJsonModule": true,
+
+    // 소스맵: 디버깅 시 컴파일된 JS가 아닌 원본 TS 코드를 볼 수 있게 해줍니다
+    "sourceMap": true
+  },
+
+  // 컴파일 대상 파일: src 디렉토리 아래의 모든 .ts 파일
+  "include": ["src/**/*"],
+
+  // 컴파일 제외: node_modules와 dist(빌드 결과물)
+  "exclude": ["node_modules", "dist"]
+}
