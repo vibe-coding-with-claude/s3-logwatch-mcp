@@ -33,11 +33,30 @@ import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 /**
  * S3 버킷 설정
  * - bucket: 로그가 저장되는 S3 버킷 이름
- * - prefix: 버킷 내 경로 접두사 (보통 "logs/")
+ * - base_prefix: 버킷 내 기본 경로 접두사 (예: "seungjae/")
+ *
+ * 왜 prefix → base_prefix로 변경했나?
+ * - 도메인별로 S3 경로를 분리하면서, 기존 prefix는 "기본 접두사" 역할만 합니다.
+ * - 실제 저장 경로는 DomainConfig.s3_prefix가 결정합니다.
+ *   예: base_prefix="seungjae/", domain.s3_prefix="seungjae/user/"
  */
 export interface S3Config {
   bucket: string;
-  prefix: string;
+  base_prefix: string;
+}
+
+/**
+ * 도메인별 S3 경로 설정
+ * - name: 도메인 이름 (예: "user", "order")
+ * - s3_prefix: 해당 도메인의 S3 경로 접두사 (예: "seungjae/user/")
+ *
+ * 왜 도메인별 경로가 필요한가?
+ * - 도메인마다 로그를 분리 저장하면, Athena 쿼리 시 특정 도메인만 스캔할 수 있습니다.
+ * - 비용 절감: 전체 로그를 읽지 않고 필요한 도메인 폴더만 읽습니다.
+ */
+export interface DomainConfig {
+  name: string;
+  s3_prefix: string;
 }
 
 /**
@@ -74,12 +93,17 @@ export interface SchemaConfig {
 
 /**
  * 파티셔닝 설정
- * - keys: Hive 파티션 키 목록 (예: ["level", "domain", "year", "month", "day"])
+ * - keys: Hive 파티션 키 목록 (예: ["year", "month", "day"])
  *
  * 파티션이란?
  * S3에 저장할 때 디렉토리 구조로 데이터를 나누는 것입니다.
- * 예: s3://bucket/logs/level=ERROR/domain=payment/year=2026/month=03/day=28/
+ * 예: s3://bucket/seungjae/user/year=2026/month=03/day=28/
  * Athena가 쿼리할 때 필요한 파티션만 읽어서 비용을 절약합니다.
+ *
+ * 왜 level과 domain을 파티션 키에서 제거했나?
+ * - domain은 S3 폴더 경로(DomainConfig.s3_prefix)로 이미 분리됩니다.
+ * - level은 로그 내 필드로 남겨두고, 파티션이 아닌 Athena WHERE 절로 필터합니다.
+ * - 파티션 키가 많으면 S3에 소규모 파일이 너무 많아져 오히려 성능이 나빠집니다.
  */
 export interface PartitionConfig {
   keys: string[];
@@ -99,12 +123,18 @@ export interface AthenaConfig {
  * CloudWatch Log Group 연결 설정
  * - log_group: CloudWatch Log Group 이름 (예: "/ecs/payment-api")
  * - filter_pattern: 구독 필터 패턴 (빈 문자열이면 모든 로그를 수집)
+ * - domain: 이 로그 그룹이 속하는 도메인 이름 (예: "user", "order")
  *
  * connect-log-group 도구로 연결을 추가하면 여기에 기록됩니다.
+ *
+ * 왜 domain 필드를 추가했나?
+ * - 로그 그룹과 도메인의 매핑을 설정에 기록해야,
+ *   어떤 로그가 어떤 S3 경로로 가는지 추적할 수 있습니다.
  */
 export interface ConnectionConfig {
   log_group: string;
   filter_pattern: string;
+  domain: string;
 }
 
 /**
@@ -120,6 +150,8 @@ export interface AppConfig {
   schema: SchemaConfig;
   partitioning: PartitionConfig;
   athena: AthenaConfig;
+  /** 도메인별 S3 경로 목록. 각 도메인은 독립적인 S3 prefix를 가집니다. */
+  domains: DomainConfig[];
   connections: ConnectionConfig[];
 }
 
@@ -134,7 +166,7 @@ export interface AppConfig {
 export const DEFAULT_CONFIG: AppConfig = {
   s3: {
     bucket: "s3-logwatch-logs",
-    prefix: "logs/",
+    base_prefix: "seungjae/",
   },
   firehose: {
     delivery_stream: "s3-logwatch-stream",
@@ -152,12 +184,23 @@ export const DEFAULT_CONFIG: AppConfig = {
     ],
   },
   partitioning: {
-    keys: ["level", "domain", "year", "month", "day"],
+    // 왜 year/month/day만 남겼나?
+    // - domain은 S3 폴더 경로로 분리 (DomainConfig.s3_prefix)
+    // - level은 로그 JSON 내 필드로, Athena WHERE 절로 필터
+    keys: ["year", "month", "day"],
   },
   athena: {
     workgroup: "s3-logwatch",
     output_location: "s3://s3-logwatch-logs/athena-results/",
   },
+  // 도메인별 S3 경로: 각 도메인의 로그가 독립적인 S3 경로에 저장됩니다.
+  domains: [
+    { name: "user", s3_prefix: "seungjae/user/" },
+    { name: "order", s3_prefix: "seungjae/order/" },
+    { name: "payment", s3_prefix: "seungjae/payment/" },
+    { name: "auth", s3_prefix: "seungjae/auth/" },
+    { name: "notification", s3_prefix: "seungjae/notification/" },
+  ],
   connections: [],
 };
 
@@ -264,8 +307,8 @@ export function validateConfig(config: AppConfig): string[] {
   if (!config.s3?.bucket) {
     errors.push("s3.bucket은 필수 항목입니다.");
   }
-  if (!config.s3?.prefix) {
-    errors.push("s3.prefix는 필수 항목입니다.");
+  if (!config.s3?.base_prefix) {
+    errors.push("s3.base_prefix는 필수 항목입니다.");
   }
 
   // Firehose 설정 검증
@@ -301,6 +344,22 @@ export function validateConfig(config: AppConfig): string[] {
   }
   if (!config.athena?.output_location) {
     errors.push("athena.output_location은 필수 항목입니다.");
+  }
+
+  // 도메인 설정 검증: 최소 1개 이상의 도메인이 필요합니다.
+  // 왜? 도메인이 없으면 로그를 저장할 S3 경로를 결정할 수 없습니다.
+  if (!Array.isArray(config.domains) || config.domains.length === 0) {
+    errors.push("domains에 최소 1개 이상의 도메인이 필요합니다.");
+  } else {
+    // 각 도메인의 필수 필드 검증
+    for (const [i, domain] of config.domains.entries()) {
+      if (!domain.name) {
+        errors.push(`domains[${i}].name은 필수 항목입니다.`);
+      }
+      if (!domain.s3_prefix) {
+        errors.push(`domains[${i}].s3_prefix는 필수 항목입니다.`);
+      }
+    }
   }
 
   // connections는 빈 배열이 허용됨 (아직 연결이 없을 수 있음)
@@ -353,6 +412,14 @@ function mergeWithDefaults(partial: Partial<AppConfig>): AppConfig {
       ...DEFAULT_CONFIG.athena,
       ...(partial.athena ?? {}),
     },
+    // 도메인 목록 병합: 사용자가 지정했으면 그대로 사용, 없으면 기본값
+    // 왜 배열을 통째로 대체하나?
+    // - 도메인 목록은 부분 병합이 의미가 없습니다 (이름이 같은 도메인을 합쳐야 하는지 등 규칙이 모호).
+    // - 사용자가 domains를 지정했으면 그것이 전체 목록이라고 간주합니다.
+    domains:
+      partial.domains && partial.domains.length > 0
+        ? partial.domains
+        : DEFAULT_CONFIG.domains,
     connections: partial.connections ?? DEFAULT_CONFIG.connections,
   };
 }
