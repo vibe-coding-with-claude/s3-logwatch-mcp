@@ -76,6 +76,19 @@ const logGroupSchema = z
   );
 
 /**
+ * domain: 이 Log Group이 속하는 도메인 이름 (필수)
+ * 왜 필수인가? Firehose가 로그의 domain 필드를 보고 S3 경로를 분기하므로,
+ * 어떤 도메인에 속하는지 반드시 지정해야 합니다.
+ * config.yaml의 domains에 등록된 도메인만 사용할 수 있습니다.
+ * 예: "user", "order", "payment"
+ */
+const domainSchema = z
+  .string()
+  .describe(
+    "Domain name this log group belongs to (e.g. 'user', 'order', 'payment'). Must be one of the domains defined in config.yaml."
+  );
+
+/**
  * filter_pattern: Subscription Filter 패턴
  * 왜 optional인가? 빈 문자열이면 모든 로그를 수집하므로, 기본값으로 충분합니다.
  * 예: "ERROR" -> ERROR가 포함된 로그만 수집
@@ -100,6 +113,29 @@ const regionSchema = z
   );
 
 // =============================================================
+// 유틸리티: 사용 가능한 도메인 이름 목록 조회
+// =============================================================
+
+/**
+ * config.yaml에서 사용 가능한 도메인 이름 목록을 가져옵니다.
+ *
+ * 왜 별도 함수인가?
+ * - 도구 설명(description)에 사용 가능한 도메인 목록을 동적으로 포함하기 위해서입니다.
+ * - 도구 등록 시점에 config를 읽어서 도메인 목록을 표시합니다.
+ *
+ * @returns 도메인 이름 문자열 배열 (예: ["user", "order", "payment"])
+ */
+function getAvailableDomainNames(): string[] {
+  try {
+    const config = loadConfig();
+    return config.domains.map((d) => d.name);
+  } catch {
+    // 설정 파일을 읽을 수 없는 경우 빈 배열 반환
+    return [];
+  }
+}
+
+// =============================================================
 // 도구 등록 함수
 // =============================================================
 
@@ -117,11 +153,17 @@ export function registerConnectTool(server: McpServer): void {
     "connect-log-group",
 
     // 도구 설명: Claude가 "payment-api 로그 연결해줘" 같은 요청을 이 도구에 매핑하는 데 사용
-    "Connect a CloudWatch Log Group to the s3-logwatch pipeline via Subscription Filter. Logs matching the filter pattern will be streamed to Firehose and stored in S3. Safe to run multiple times (idempotent - updates existing filter).",
+    // domain 파라미터가 필수임을 명시하고, 사용 가능한 도메인 목록을 동적으로 포함합니다.
+    `Connect a CloudWatch Log Group to the s3-logwatch pipeline via Subscription Filter. ` +
+      `Requires a 'domain' parameter to specify which domain this log group belongs to. ` +
+      `Available domains: ${getAvailableDomainNames().join(", ")}. ` +
+      `Logs matching the filter pattern will be streamed to Firehose and stored in S3. ` +
+      `Safe to run multiple times (idempotent - updates existing filter).`,
 
-    // 입력 파라미터 스키마
+    // 입력 파라미터 스키마 (domain 추가)
     {
       log_group: logGroupSchema,
+      domain: domainSchema,
       filter_pattern: filterPatternSchema,
       region: regionSchema,
     },
@@ -131,6 +173,7 @@ export function registerConnectTool(server: McpServer): void {
       try {
         const result = await connectLogGroup(
           args.log_group,
+          args.domain,
           args.filter_pattern,
           args.region
         );
@@ -176,12 +219,14 @@ export function registerConnectTool(server: McpServer): void {
  * 5. config.yaml의 connections 목록 업데이트
  *
  * @param logGroup - CloudWatch Log Group 이름
+ * @param domain - 이 Log Group이 속하는 도메인 이름 (필수)
  * @param filterPattern - 필터 패턴 (기본값: "" = 전체 로그)
  * @param region - AWS 리전 (기본값: us-east-1)
  * @returns 성공 메시지 문자열
  */
 async function connectLogGroup(
   logGroup: string,
+  domain: string,
   filterPattern?: string,
   region?: string
 ): Promise<string> {
@@ -197,6 +242,17 @@ async function connectLogGroup(
     throw new Error(
       "config.yaml에 firehose.delivery_stream이 설정되어 있지 않습니다. " +
         "먼저 init-infra 도구를 실행하여 인프라를 초기화해주세요."
+    );
+  }
+
+  // --- (1.5) domain 검증 ---
+  // 입력된 domain이 config.yaml의 domains 목록에 존재하는지 확인합니다.
+  // 존재하지 않는 도메인을 사용하면 로그가 올바른 S3 경로에 저장되지 않습니다.
+  const availableDomains = config.domains.map((d) => d.name);
+  if (!availableDomains.includes(domain)) {
+    throw new Error(
+      `도메인 '${domain}'이 존재하지 않습니다. ` +
+        `사용 가능한 도메인: ${availableDomains.join(", ")}`
     );
   }
 
@@ -225,7 +281,7 @@ async function connectLogGroup(
   // --- (4) Subscription Filter 생성 ---
   // PutSubscriptionFilter는 같은 filterName이 이미 있으면 업데이트합니다 (upsert 동작).
   // 따라서 멱등성이 자동으로 보장됩니다.
-  const filterName = buildFilterName(logGroup);
+  const filterName = buildFilterName(logGroup, domain);
   await cwlClient.send(
     new PutSubscriptionFilterCommand({
       // filterName: Subscription Filter를 식별하는 고유 이름
@@ -245,7 +301,7 @@ async function connectLogGroup(
   // --- (5) config.yaml의 connections 목록 업데이트 ---
   // 왜 config에 기록하나? 어떤 Log Group이 연결되어 있는지 추적하기 위해서입니다.
   // 이미 존재하는 log_group이면 filter_pattern을 업데이트합니다.
-  updateConnections(config, logGroup, resolvedFilterPattern);
+  updateConnections(config, logGroup, resolvedFilterPattern, domain);
   saveConfig(config);
 
   // --- (6) 결과 메시지 반환 ---
@@ -258,12 +314,13 @@ async function connectLogGroup(
     `Log Group 연결 완료!`,
     ``,
     `  Log Group:      ${logGroup}`,
+    `  Domain:         ${domain}`,
     `  Filter:         ${filterInfo}`,
     `  Filter Name:    ${filterName}`,
     `  Firehose:       ${deliveryStreamName}`,
     `  IAM Role:       ${CWL_TO_FIREHOSE_ROLE_NAME}`,
     ``,
-    `이제 ${logGroup}의 로그가 Firehose를 통해 S3에 저장됩니다.`,
+    `이제 ${logGroup}의 로그가 '${domain}' 도메인으로 Firehose를 통해 S3에 저장됩니다.`,
     `다른 Log Group도 연결하려면 connect-log-group 도구를 다시 호출하세요.`,
   ].join("\n");
 }
@@ -453,21 +510,23 @@ async function putFirehosePermissionPolicy(
  * 변환 규칙:
  * - 앞뒤 슬래시를 제거합니다
  * - 슬래시(/)를 하이픈(-)으로 변환합니다
- * - "s3-logwatch-" 접두사를 붙입니다
+ * - "s3-logwatch-{domain}-" 접두사를 붙입니다
  *
- * 예: "/ecs/payment-api" -> "s3-logwatch-ecs-payment-api"
+ * 예: domain="payment", logGroup="/ecs/payment-api"
+ *     -> "s3-logwatch-payment-ecs-payment-api"
  *
- * 왜 이렇게 변환하나?
- * - Subscription Filter 이름에 슬래시는 사용할 수 없습니다.
- * - 접두사를 붙여서 s3-logwatch가 만든 필터임을 식별합니다.
+ * 왜 domain을 이름에 포함하나?
+ * - 같은 Log Group이 다른 도메인으로 재연결될 때 필터 이름이 달라져야 합니다.
+ * - 필터 이름만 보고도 어떤 도메인에 속하는지 식별할 수 있습니다.
  *
  * @param logGroup - CloudWatch Log Group 이름
+ * @param domain - 도메인 이름
  * @returns Subscription Filter 이름
  */
-function buildFilterName(logGroup: string): string {
+function buildFilterName(logGroup: string, domain: string): string {
   // 앞뒤 슬래시 제거 후 나머지 슬래시를 하이픈으로 변환
   const sanitized = logGroup.replace(/^\/+|\/+$/g, "").replace(/\//g, "-");
-  return `s3-logwatch-${sanitized}`;
+  return `s3-logwatch-${domain}-${sanitized}`;
 }
 
 // =============================================================
@@ -489,11 +548,13 @@ function buildFilterName(logGroup: string): string {
  * @param config - 현재 AppConfig 객체 (직접 수정됩니다)
  * @param logGroup - Log Group 이름
  * @param filterPattern - 필터 패턴
+ * @param domain - 이 Log Group이 속하는 도메인 이름
  */
 function updateConnections(
-  config: { connections: { log_group: string; filter_pattern: string }[] },
+  config: { connections: { log_group: string; filter_pattern: string; domain: string }[] },
   logGroup: string,
-  filterPattern: string
+  filterPattern: string,
+  domain: string
 ): void {
   // 이미 존재하는 연결인지 찾습니다
   const existingIndex = config.connections.findIndex(
@@ -501,13 +562,15 @@ function updateConnections(
   );
 
   if (existingIndex >= 0) {
-    // 이미 존재하면 filter_pattern만 업데이트
+    // 이미 존재하면 filter_pattern과 domain을 업데이트
     config.connections[existingIndex].filter_pattern = filterPattern;
+    config.connections[existingIndex].domain = domain;
   } else {
-    // 새로운 연결 추가
+    // 새로운 연결 추가 (domain 포함)
     config.connections.push({
       log_group: logGroup,
       filter_pattern: filterPattern,
+      domain,
     });
   }
 }
