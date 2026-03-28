@@ -121,12 +121,50 @@ const regionSchema = z
  * server.tool()로 도구 이름, 설명, 스키마, 핸들러를 등록합니다.
  */
 export function registerQueryTool(server: McpServer): void {
+  // =============================================================
+  // 도구 설명을 동적으로 생성합니다.
+  // config.yaml에서 domains 목록을 읽어, Claude가 SQL 생성 시
+  // 적절한 WHERE domain='...' 조건을 포함하도록 유도합니다.
+  // =============================================================
+  const config = loadConfig();
+
+  // 도메인 이름 목록을 추출합니다 (예: "user, order, payment, auth, notification")
+  const domainNames = config.domains.map((d) => d.name).join(", ");
+
+  // 스키마 컬럼 정보를 추출합니다 (예: "timestamp (timestamp), level (string), ...")
+  const columnDescriptions = config.schema.columns
+    .map((c) => `${c.name} (${c.type})`)
+    .join(", ");
+
+  // 파티션 키 정보를 추출합니다 (예: "domain (string), year (string), ...")
+  // domain은 Glue partition projection으로 자동 생성되는 파티션 컬럼입니다.
+  const partitionDescriptions = ["domain (string)"]
+    .concat(config.partitioning.keys.map((k) => `${k} (string)`))
+    .join(", ");
+
+  // 도구 설명: Claude가 이 정보를 참조하여 올바른 SQL을 생성합니다.
+  // 테이블 스키마, 파티션 구조, 사용 가능한 도메인 목록을 포함합니다.
+  const toolDescription = [
+    "Execute an Athena SQL query on s3-logwatch log data.",
+    "",
+    `Database: ${GLUE_DATABASE_NAME}`,
+    "Table: logs",
+    "",
+    `Columns: ${columnDescriptions}`,
+    `Partition columns: ${partitionDescriptions}`,
+    "",
+    `Available domains: ${domainNames}`,
+    "",
+    "IMPORTANT: Always include WHERE domain='...' for efficient partition filtering.",
+    `Example: SELECT * FROM logs WHERE domain='user' AND year='2026' AND month='03' LIMIT 10`,
+  ].join("\n");
+
   server.tool(
     // 도구 이름: Claude Code가 이 이름으로 도구를 호출합니다
     "athena-query",
 
-    // 도구 설명: Claude가 "로그 분석해줘"같은 요청에 이 도구를 선택하도록 돕습니다
-    "Execute an Athena SQL query against S3 log data. Returns query results as a formatted table with scan size and estimated cost. Use this to analyze logs stored in S3 via the s3-logwatch pipeline.",
+    // 도구 설명: config에서 읽은 도메인 목록과 스키마 정보를 포함한 동적 설명
+    toolDescription,
 
     // 입력 파라미터 스키마
     {
