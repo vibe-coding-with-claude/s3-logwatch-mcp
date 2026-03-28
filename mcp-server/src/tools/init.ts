@@ -4,12 +4,17 @@
  * 이 파일의 역할:
  * - "init-infra"라는 MCP 도구를 등록합니다.
  * - Claude Code가 "인프라 초기화해줘"라고 하면 이 도구가 호출됩니다.
- * - S3, Glue, IAM, Firehose, Athena 리소스를 한 번에 생성합니다.
+ * - S3, IAM, Firehose, Athena 리소스를 한 번에 생성합니다.
  *
  * 멱등성(Idempotency):
  * - 이미 존재하는 리소스는 스킵합니다.
  * - 두 번 실행해도 에러 없이 동작합니다.
  * - 각 리소스마다 "이미 존재하는가?" 확인 -> 없으면 생성 패턴을 사용합니다.
+ *
+ * Glue SDK 제거:
+ * - 이전에는 Glue SDK로 테이블을 생성했지만, Athena DDL(CREATE EXTERNAL TABLE)로
+ *   직접 만들면 Glue SDK가 불필요합니다.
+ * - Athena에서 CREATE TABLE하면 내부적으로 Glue Data Catalog에 등록됩니다.
  *
  * AWS SDK v3 사용 이유:
  * - TypeScript 네이티브 지원 (타입이 완벽)
@@ -37,14 +42,6 @@ import {
 } from "@aws-sdk/client-s3";
 
 import {
-  GlueClient,
-  CreateDatabaseCommand,
-  GetDatabaseCommand,
-  CreateTableCommand,
-  GetTableCommand,
-} from "@aws-sdk/client-glue";
-
-import {
   IAMClient,
   CreateRoleCommand,
   GetRoleCommand,
@@ -61,6 +58,8 @@ import {
   AthenaClient,
   CreateWorkGroupCommand,
   GetWorkGroupCommand,
+  StartQueryExecutionCommand,
+  GetQueryExecutionCommand,
 } from "@aws-sdk/client-athena";
 
 // =============================================================
@@ -88,11 +87,11 @@ interface ResourceResult {
 // 상수 정의
 // =============================================================
 
-/** Glue 데이터베이스 이름. AWS Glue는 하이픈을 허용하지 않으므로 언더스코어를 사용합니다. */
-const GLUE_DATABASE_NAME = "s3_logwatch";
+/** Athena/Glue 데이터베이스 이름. Glue는 하이픈을 허용하지 않으므로 언더스코어를 사용합니다. */
+const DATABASE_NAME = "s3_logwatch";
 
-/** Glue 테이블 이름 */
-const GLUE_TABLE_NAME = "logs";
+/** Athena/Glue 테이블 이름 */
+const TABLE_NAME = "logs";
 
 /** Firehose용 IAM 역할 이름 */
 const FIREHOSE_ROLE_NAME = "s3-logwatch-firehose-role";
@@ -132,7 +131,7 @@ export function registerInitTool(server: McpServer): void {
     "init-infra",
 
     // 도구 설명: Claude가 "인프라 초기화해줘" 같은 요청을 이 도구에 매핑하는 데 사용
-    "Initialize all AWS infrastructure for s3-logwatch. Creates S3 bucket, Glue database/table, IAM role, Kinesis Data Firehose delivery stream, and Athena workgroup. Safe to run multiple times (idempotent).",
+    "Initialize all AWS infrastructure for s3-logwatch. Creates S3 bucket, Athena database/table (via DDL), IAM role, Kinesis Data Firehose delivery stream, and Athena workgroup. Safe to run multiple times (idempotent).",
 
     // 입력 파라미터 스키마
     {
@@ -162,6 +161,97 @@ export function registerInitTool(server: McpServer): void {
 }
 
 // =============================================================
+// Athena DDL 헬퍼 함수
+// =============================================================
+
+/**
+ * Athena를 통해 DDL(SQL)을 실행하고 완료될 때까지 폴링합니다.
+ *
+ * 왜 폴링이 필요한가?
+ * - Athena 쿼리는 비동기적으로 실행됩니다.
+ * - StartQueryExecution으로 쿼리를 제출하면 QueryExecutionId를 받습니다.
+ * - GetQueryExecution으로 상태를 확인하여 SUCCEEDED/FAILED/CANCELLED를 기다립니다.
+ *
+ * @param athena - AthenaClient 인스턴스
+ * @param sql - 실행할 DDL SQL 문자열
+ * @param workgroup - Athena 워크그룹 이름
+ * @param outputLocation - 쿼리 결과 저장 S3 경로
+ */
+export async function executeAthenaDDL(
+  athena: AthenaClient,
+  sql: string,
+  workgroup: string,
+  outputLocation: string
+): Promise<void> {
+  // DDL 쿼리를 Athena에 제출합니다
+  const start = await athena.send(new StartQueryExecutionCommand({
+    QueryString: sql,
+    WorkGroup: workgroup,
+    ResultConfiguration: { OutputLocation: outputLocation },
+  }));
+
+  const queryId = start.QueryExecutionId!;
+
+  // 쿼리 완료까지 1초 간격으로 폴링합니다
+  while (true) {
+    await new Promise(r => setTimeout(r, 1000));
+    const status = await athena.send(new GetQueryExecutionCommand({
+      QueryExecutionId: queryId,
+    }));
+    const state = status.QueryExecution?.Status?.State;
+    if (state === "SUCCEEDED") break;
+    if (state === "FAILED" || state === "CANCELLED") {
+      throw new Error(`DDL 실패: ${status.QueryExecution?.Status?.StateChangeReason}`);
+    }
+  }
+}
+
+/**
+ * config를 받아서 CREATE EXTERNAL TABLE DDL 문자열을 생성합니다.
+ *
+ * Partition Projection 설명:
+ * - Athena가 파티션을 자동 인식하도록 TBLPROPERTIES에 설정합니다.
+ * - MSCK REPAIR TABLE을 실행하지 않아도 새 파티션을 인식합니다.
+ * - domain: config.domains에서 동적으로 enum 값을 생성합니다.
+ * - year/month/day: 정수 범위로 날짜 파티션을 정의합니다.
+ *
+ * @param config - 앱 설정 (s3, domains 등)
+ * @returns CREATE EXTERNAL TABLE IF NOT EXISTS DDL 문자열
+ */
+export function buildCreateTableDDL(config: ReturnType<typeof loadConfig>): string {
+  // config.domains에서 도메인 이름 목록을 추출하여 쉼표로 연결
+  const domainValues = config.domains.map(d => d.name).join(",");
+
+  return `
+    CREATE EXTERNAL TABLE IF NOT EXISTS ${DATABASE_NAME}.${TABLE_NAME} (
+      timestamp string,
+      level string,
+      service string,
+      message string,
+      trace_id string
+    )
+    PARTITIONED BY (domain string, year string, month string, day string)
+    ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
+    WITH SERDEPROPERTIES ('case.insensitive' = 'true')
+    LOCATION 's3://${config.s3.bucket}/${config.s3.base_prefix}'
+    TBLPROPERTIES (
+      'projection.enabled' = 'true',
+      'projection.domain.type' = 'enum',
+      'projection.domain.values' = '${domainValues}',
+      'projection.year.type' = 'integer',
+      'projection.year.range' = '2024,2030',
+      'projection.month.type' = 'integer',
+      'projection.month.range' = '1,12',
+      'projection.month.digits' = '2',
+      'projection.day.type' = 'integer',
+      'projection.day.range' = '1,31',
+      'projection.day.digits' = '2',
+      'storage.location.template' = 's3://${config.s3.bucket}/${config.s3.base_prefix}\${domain}/\${year}/\${month}/\${day}/'
+    )
+  `;
+}
+
+// =============================================================
 // 메인 초기화 로직
 // =============================================================
 
@@ -170,10 +260,10 @@ export function registerInitTool(server: McpServer): void {
  *
  * 순서가 중요한 이유:
  * 1. S3 버킷: Firehose가 로그를 저장할 목적지
- * 2. Glue DB/테이블: Firehose가 Parquet 변환 시 스키마를 참조
- * 3. IAM 역할: Firehose가 S3에 쓰고 Glue를 읽을 권한
- * 4. Firehose: 위 3개가 다 준비된 후에야 생성 가능
- * 5. Athena 워크그룹: 독립적이지만 논리적으로 마지막
+ * 2. Athena 워크그룹: DDL 실행에 필요 (워크그룹이 있어야 쿼리 실행 가능)
+ * 3. Athena DDL로 DB/테이블 생성: Glue Data Catalog에 자동 등록됨
+ * 4. IAM 역할: Firehose가 S3에 쓰고 Glue를 읽을 권한
+ * 5. Firehose: 위 4개가 다 준비된 후에야 생성 가능
  *
  * @param region - AWS 리전 (기본값: us-east-1)
  * @returns 각 리소스별 생성 결과 배열
@@ -187,7 +277,6 @@ async function initInfra(region?: string): Promise<ResourceResult[]> {
   // 왜 매번 생성하나? MCP 도구는 호출 간에 상태를 유지하지 않습니다.
   // 리전이 호출마다 다를 수 있으므로 클라이언트도 매번 새로 만듭니다.
   const s3 = new S3Client({ region: resolvedRegion });
-  const glue = new GlueClient({ region: resolvedRegion });
   const iam = new IAMClient({ region: resolvedRegion });
   const firehose = new FirehoseClient({ region: resolvedRegion });
   const athena = new AthenaClient({ region: resolvedRegion });
@@ -195,12 +284,16 @@ async function initInfra(region?: string): Promise<ResourceResult[]> {
   // --- (a) S3 버킷 생성 ---
   results.push(await createS3Bucket(s3, config.s3.bucket, resolvedRegion));
 
-  // --- (b) Glue 데이터베이스 생성 ---
-  results.push(await createGlueDatabase(glue));
-
-  // --- (c) Glue 테이블 생성 ---
+  // --- (b) Athena 워크그룹 생성 (DDL 실행 전에 워크그룹이 필요) ---
   results.push(
-    await createGlueTable(glue, config)
+    await createAthenaWorkgroup(athena, config)
+  );
+
+  // --- (c) Athena DDL로 데이터베이스 + 테이블 생성 ---
+  // Glue SDK 대신 Athena DDL을 사용합니다.
+  // CREATE DATABASE/TABLE IF NOT EXISTS로 멱등성을 보장합니다.
+  results.push(
+    await createAthenaTable(athena, config)
   );
 
   // --- (d) IAM 역할 생성 ---
@@ -214,11 +307,6 @@ async function initInfra(region?: string): Promise<ResourceResult[]> {
   // 실패하면 "잠시 후 다시 시도하세요" 안내를 포함합니다.
   results.push(
     await createFirehoseStream(firehose, config, resolvedRegion, accountId)
-  );
-
-  // --- (f) Athena 워크그룹 생성 ---
-  results.push(
-    await createAthenaWorkgroup(athena, config)
   );
 
   return results;
@@ -304,565 +392,7 @@ async function createS3Bucket(
 }
 
 // =============================================================
-// (b) Glue 데이터베이스 생성
-// =============================================================
-
-/**
- * Glue 데이터베이스를 생성합니다.
- *
- * Glue Data Catalog란?
- * - AWS의 메타데이터 저장소입니다.
- * - Athena가 "어떤 테이블이 있고, 컬럼은 뭐고, 데이터는 어디에 있는지"를
- *   Glue Data Catalog에서 조회합니다.
- * - 데이터베이스 > 테이블 > 컬럼 계층 구조입니다.
- *
- * 왜 이름에 언더스코어를 사용하나?
- * - Glue 데이터베이스 이름에 하이픈(-)을 사용할 수 없습니다.
- * - "s3-logwatch" -> "s3_logwatch"로 변환합니다.
- */
-async function createGlueDatabase(
-  glue: GlueClient
-): Promise<ResourceResult> {
-  try {
-    await glue.send(
-      new GetDatabaseCommand({ Name: GLUE_DATABASE_NAME })
-    );
-    return {
-      name: "Glue Database",
-      status: "exists",
-      detail: `${GLUE_DATABASE_NAME} (이미 존재)`,
-    };
-  } catch (error: unknown) {
-    const errorName = (error as { name?: string })?.name ?? "";
-    if (errorName !== "EntityNotFoundException") {
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        name: "Glue Database",
-        status: "failed",
-        detail: `${GLUE_DATABASE_NAME} - ${message}`,
-      };
-    }
-  }
-
-  try {
-    await glue.send(
-      new CreateDatabaseCommand({
-        DatabaseInput: {
-          Name: GLUE_DATABASE_NAME,
-          Description:
-            "s3-logwatch: S3 로그 분석용 Glue 데이터베이스. Athena에서 이 DB의 테이블을 쿼리합니다.",
-        },
-      })
-    );
-    return {
-      name: "Glue Database",
-      status: "created",
-      detail: GLUE_DATABASE_NAME,
-    };
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
-    return {
-      name: "Glue Database",
-      status: "failed",
-      detail: `${GLUE_DATABASE_NAME} - ${message}`,
-    };
-  }
-}
-
-// =============================================================
-// (c) Glue 테이블 생성
-// =============================================================
-
-/**
- * 스키마 컬럼의 타입을 Glue/Athena 호환 타입으로 매핑합니다.
- *
- * 왜 매핑이 필요한가?
- * - config.yaml에는 "timestamp", "string" 같은 간단한 타입명을 사용합니다.
- * - Glue는 Hive 타입 체계를 따르므로 변환이 필요합니다.
- * - 예: "timestamp" -> "timestamp" (동일), "string" -> "string" (동일)
- * - 향후 "int", "double" 등을 추가할 때 여기서 매핑합니다.
- */
-function mapColumnType(configType: string): string {
-  const typeMap: Record<string, string> = {
-    string: "string",
-    timestamp: "timestamp",
-    int: "int",
-    bigint: "bigint",
-    double: "double",
-    boolean: "boolean",
-  };
-  return typeMap[configType] ?? "string";
-}
-
-/**
- * Glue 테이블을 생성합니다.
- *
- * 이 테이블의 역할:
- * 1. Athena가 쿼리할 때 "이 테이블의 컬럼과 타입은 무엇인가?"를 여기서 조회합니다.
- * 2. Firehose가 Parquet 변환 시 "어떤 스키마로 변환할 것인가?"를 여기서 참조합니다.
- * 3. S3 데이터의 위치(Location)를 지정합니다.
- *
- * InputFormat/OutputFormat/SerDe 설명:
- * - SerDe(Serializer/Deserializer): 데이터를 읽고 쓰는 방법을 정의합니다.
- * - JSON SerDe: org.openx.data.jsonserde.JsonSerDe
- * - JSON을 사용하는 이유: mock 데이터와 CloudWatch Logs 원본 모두 JSON 포맷.
- *   Firehose Parquet 변환은 별도 경로에서 처리하고,
- *   이 테이블은 JSON Lines 파일을 직접 읽습니다.
- */
-async function createGlueTable(
-  glue: GlueClient,
-  config: ReturnType<typeof loadConfig>
-): Promise<ResourceResult> {
-  try {
-    await glue.send(
-      new GetTableCommand({
-        DatabaseName: GLUE_DATABASE_NAME,
-        Name: GLUE_TABLE_NAME,
-      })
-    );
-    return {
-      name: "Glue Table",
-      status: "exists",
-      detail: `${GLUE_DATABASE_NAME}.${GLUE_TABLE_NAME} (이미 존재)`,
-    };
-  } catch (error: unknown) {
-    const errorName = (error as { name?: string })?.name ?? "";
-    if (errorName !== "EntityNotFoundException") {
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        name: "Glue Table",
-        status: "failed",
-        detail: `${GLUE_DATABASE_NAME}.${GLUE_TABLE_NAME} - ${message}`,
-      };
-    }
-  }
-
-  try {
-    // config.yaml의 schema.columns를 Glue 컬럼 형식으로 변환
-    let columns = config.schema.columns.map((col) => ({
-      Name: col.name,
-      Type: mapColumnType(col.type),
-    }));
-
-    // 파티션 키와 겹치는 컬럼을 제거합니다
-    // Glue에서 파티션 키와 일반 컬럼에 같은 이름이 있으면 "duplicate columns" 에러가 발생합니다
-    const partitionKeyNames = new Set(config.partitioning.keys);
-    columns = columns.filter((c) => !partitionKeyNames.has(c.Name));
-
-    // 파티션 키를 Glue 컬럼 형식으로 변환
-    // 파티션 키는 모두 string 타입입니다 (Hive 파티셔닝 디렉토리 이름이므로)
-    const partitionKeys = config.partitioning.keys.map((key) => ({
-      Name: key,
-      Type: "string",
-    }));
-
-    // S3 데이터 위치: s3://버킷/prefix
-    const location = `s3://${config.s3.bucket}/${config.s3.prefix}`;
-
-    await glue.send(
-      new CreateTableCommand({
-        DatabaseName: GLUE_DATABASE_NAME,
-        TableInput: {
-          Name: GLUE_TABLE_NAME,
-          Description:
-            "s3-logwatch 로그 테이블. Firehose가 Parquet로 변환하여 S3에 저장한 로그를 Athena로 쿼리합니다.",
-          // 일반 컬럼 (파티션 키 제외)
-          StorageDescriptor: {
-            Columns: columns,
-            Location: location,
-            // JSON 입력 포맷: S3의 JSON Lines 파일을 읽습니다
-            InputFormat: "org.apache.hadoop.mapred.TextInputFormat",
-            // 텍스트 출력 포맷
-            OutputFormat:
-              "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat",
-            // SerDe: JSON 데이터를 읽고 쓰는 방법을 정의
-            // OpenX JSON SerDe는 Athena가 공식 지원하는 JSON 파서입니다
-            SerdeInfo: {
-              SerializationLibrary: "org.openx.data.jsonserde.JsonSerDe",
-              Parameters: {
-                // case.insensitive: JSON 키의 대소문자를 구분하지 않음
-                "case.insensitive": "true",
-              },
-            },
-            Compressed: false,
-            StoredAsSubDirectories: false,
-          },
-          // 파티션 키: Hive 스타일 파티셔닝에 사용됩니다
-          // 이 키들이 S3 경로의 디렉토리 구조가 됩니다
-          // 예: level=ERROR/domain=payment/year=2026/month=03/day=28/
-          PartitionKeys: partitionKeys,
-          // 테이블 타입: 외부 테이블 (S3의 데이터를 직접 참조)
-          TableType: "EXTERNAL_TABLE",
-          Parameters: {
-            // JSON 분류
-            classification: "json",
-            // 파티션 프로젝션: Athena가 파티션을 자동 인식하도록 설정
-            // MSCK REPAIR TABLE을 실행하지 않아도 새 파티션을 인식합니다
-            "projection.enabled": "true",
-            "projection.level.type": "enum",
-            "projection.level.values": "TRACE,DEBUG,INFO,WARN,ERROR,FATAL",
-            "projection.domain.type": "enum",
-            "projection.domain.values": "payment,auth,order,user,notification",
-            "projection.year.type": "integer",
-            "projection.year.range": "2024,2030",
-            "projection.month.type": "integer",
-            "projection.month.range": "1,12",
-            "projection.month.digits": "2",
-            "projection.day.type": "integer",
-            "projection.day.range": "1,31",
-            "projection.day.digits": "2",
-            // 파티션 프로젝션의 저장 위치 템플릿
-            "storage.location.template": `s3://${config.s3.bucket}/${config.s3.prefix}level=\${level}/domain=\${domain}/year=\${year}/month=\${month}/day=\${day}/`,
-          },
-        },
-      })
-    );
-
-    return {
-      name: "Glue Table",
-      status: "created",
-      detail: `${GLUE_DATABASE_NAME}.${GLUE_TABLE_NAME}`,
-    };
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
-    return {
-      name: "Glue Table",
-      status: "failed",
-      detail: `${GLUE_DATABASE_NAME}.${GLUE_TABLE_NAME} - ${message}`,
-    };
-  }
-}
-
-// =============================================================
-// (d) IAM 역할 생성
-// =============================================================
-
-/**
- * AWS 계정 ID를 가져오기 위한 헬퍼
- *
- * 왜 필요한가?
- * - IAM 정책에서 S3 버킷 ARN, Glue 리소스 ARN을 지정할 때 계정 ID가 필요합니다.
- * - STS GetCallerIdentity를 쓸 수도 있지만, 추가 패키지 의존성을 피하기 위해
- *   IAM 정책에서는 와일드카드(*)를 사용하고 리소스 ARN으로 범위를 제한합니다.
- *
- * accountId가 비어있을 수 있으므로 Glue ARN에서 와일드카드를 사용합니다.
- */
-async function getAccountIdFromBucketArn(
-  _bucketName: string,
-  _region: string
-): Promise<string> {
-  // STS 의존성을 추가하지 않기 위해 빈 문자열을 반환합니다.
-  // IAM 정책에서 계정 ID가 필요한 Glue ARN은 와일드카드(*)를 사용합니다.
-  return "";
-}
-
-/**
- * Firehose용 IAM 역할을 생성합니다.
- *
- * IAM 역할이란?
- * - AWS 서비스가 다른 AWS 서비스에 접근할 때 필요한 "신분증"입니다.
- * - Firehose가 S3에 파일을 쓰려면 "S3에 쓸 수 있는 역할"이 필요합니다.
- *
- * Trust Policy (신뢰 정책):
- * - "누가 이 역할을 사용할 수 있는가?"를 정의합니다.
- * - firehose.amazonaws.com만 이 역할을 사용할 수 있도록 합니다.
- *
- * Inline Policy (인라인 정책):
- * - "이 역할로 무엇을 할 수 있는가?"를 정의합니다.
- * - S3: PutObject, GetObject, ListBucket (로그 파일 쓰기)
- * - Glue: GetTable, GetDatabase (Parquet 변환 시 스키마 조회)
- */
-async function createFirehoseIamRole(
-  iam: IAMClient,
-  bucketName: string,
-  region: string,
-  _accountId: string
-): Promise<ResourceResult> {
-  // 역할 존재 여부 확인
-  try {
-    await iam.send(new GetRoleCommand({ RoleName: FIREHOSE_ROLE_NAME }));
-    return {
-      name: "IAM Role",
-      status: "exists",
-      detail: `${FIREHOSE_ROLE_NAME} (이미 존재)`,
-    };
-  } catch (error: unknown) {
-    const errorName = (error as { name?: string })?.name ?? "";
-    if (errorName !== "NoSuchEntityException") {
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        name: "IAM Role",
-        status: "failed",
-        detail: `${FIREHOSE_ROLE_NAME} - ${message}`,
-      };
-    }
-  }
-
-  try {
-    // Trust Policy: Firehose 서비스만 이 역할을 assume할 수 있습니다
-    const trustPolicy = {
-      Version: "2012-10-17",
-      Statement: [
-        {
-          Effect: "Allow",
-          Principal: {
-            Service: "firehose.amazonaws.com",
-          },
-          Action: "sts:AssumeRole",
-        },
-      ],
-    };
-
-    // 역할 생성
-    await iam.send(
-      new CreateRoleCommand({
-        RoleName: FIREHOSE_ROLE_NAME,
-        AssumeRolePolicyDocument: JSON.stringify(trustPolicy),
-        Description:
-          "s3-logwatch: Firehose가 S3에 로그를 쓰고 Glue 스키마를 조회하기 위한 역할",
-      })
-    );
-
-    // Inline Policy: S3 쓰기 + Glue 읽기 권한
-    // 왜 Managed Policy가 아닌 Inline Policy인가?
-    // - 이 역할에만 필요한 최소 권한을 정확히 정의하기 위해서입니다.
-    // - Managed Policy는 범용적이어서 불필요한 권한이 포함될 수 있습니다.
-    const inlinePolicy = {
-      Version: "2012-10-17",
-      Statement: [
-        {
-          // S3 버킷에 로그 파일을 쓰는 권한
-          Sid: "S3Access",
-          Effect: "Allow",
-          Action: [
-            "s3:PutObject",
-            "s3:GetObject",
-            "s3:ListBucket",
-            "s3:GetBucketLocation",
-          ],
-          Resource: [
-            `arn:aws:s3:::${bucketName}`,
-            `arn:aws:s3:::${bucketName}/*`,
-          ],
-        },
-        {
-          // Glue 테이블 스키마를 조회하는 권한 (Parquet 변환에 필요)
-          Sid: "GlueAccess",
-          Effect: "Allow",
-          Action: [
-            "glue:GetTable",
-            "glue:GetTableVersion",
-            "glue:GetTableVersions",
-            "glue:GetDatabase",
-          ],
-          // Glue ARN은 계정 ID가 필요하지만, 와일드카드로 처리합니다
-          // 보안상 리소스 이름으로 범위를 충분히 제한합니다
-          Resource: [
-            `arn:aws:glue:${region}:*:catalog`,
-            `arn:aws:glue:${region}:*:database/${GLUE_DATABASE_NAME}`,
-            `arn:aws:glue:${region}:*:table/${GLUE_DATABASE_NAME}/${GLUE_TABLE_NAME}`,
-          ],
-        },
-      ],
-    };
-
-    await iam.send(
-      new PutRolePolicyCommand({
-        RoleName: FIREHOSE_ROLE_NAME,
-        PolicyName: "s3-logwatch-firehose-policy",
-        PolicyDocument: JSON.stringify(inlinePolicy),
-      })
-    );
-
-    return {
-      name: "IAM Role",
-      status: "created",
-      detail: `${FIREHOSE_ROLE_NAME} (S3 PutObject + Glue GetTable 권한)`,
-    };
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
-    return {
-      name: "IAM Role",
-      status: "failed",
-      detail: `${FIREHOSE_ROLE_NAME} - ${message}`,
-    };
-  }
-}
-
-// =============================================================
-// (e) Firehose Delivery Stream 생성
-// =============================================================
-
-/**
- * Kinesis Data Firehose delivery stream을 생성합니다.
- *
- * Firehose란?
- * - AWS의 스트리밍 데이터 전송 서비스입니다.
- * - CloudWatch Logs에서 받은 JSON 로그를 Parquet으로 변환하여 S3에 저장합니다.
- * - 버퍼링: 일정 시간(buffer_interval) 또는 크기(buffer_size)가 차면 S3에 씁니다.
- *
- * ExtendedS3DestinationConfiguration:
- * - Firehose의 S3 출력 설정입니다.
- * - Prefix: Hive 파티셔닝 경로 (level=ERROR/domain=payment/...)
- * - DataFormatConversionConfiguration: JSON -> Parquet 변환 설정
- *
- * Hive 파티셔닝 Prefix 문법:
- * - !{partitionKeyFromQuery:level}: 로그의 level 필드 값을 파티션 경로에 사용
- * - !{timestamp:yyyy}: 타임스탬프에서 연도를 추출하여 경로에 사용
- */
-async function createFirehoseStream(
-  firehose: FirehoseClient,
-  config: ReturnType<typeof loadConfig>,
-  region: string,
-  _accountId: string
-): Promise<ResourceResult> {
-  const streamName = config.firehose.delivery_stream;
-
-  // 존재 여부 확인
-  try {
-    await firehose.send(
-      new DescribeDeliveryStreamCommand({
-        DeliveryStreamName: streamName,
-      })
-    );
-    return {
-      name: "Firehose Stream",
-      status: "exists",
-      detail: `${streamName} (이미 존재)`,
-    };
-  } catch (error: unknown) {
-    const errorName = (error as { name?: string })?.name ?? "";
-    if (errorName !== "ResourceNotFoundException") {
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        name: "Firehose Stream",
-        status: "failed",
-        detail: `${streamName} - ${message}`,
-      };
-    }
-  }
-
-  try {
-    // IAM 역할의 ARN을 조회합니다
-    // 왜 다시 조회하나? 역할이 이미 존재했을 수도, 방금 생성했을 수도 있으므로
-    // 항상 최신 ARN을 가져옵니다.
-    const roleResponse = await new IAMClient({ region }).send(
-      new GetRoleCommand({ RoleName: FIREHOSE_ROLE_NAME })
-    );
-    const roleArn = roleResponse.Role?.Arn;
-
-    if (!roleArn) {
-      return {
-        name: "Firehose Stream",
-        status: "failed",
-        detail: `${streamName} - IAM 역할 ARN을 가져올 수 없습니다. init-infra를 다시 실행해주세요.`,
-      };
-    }
-
-    const bucketArn = `arn:aws:s3:::${config.s3.bucket}`;
-
-    // Hive 파티셔닝 Prefix 설명:
-    // level=!{partitionKeyFromQuery:level}: 로그 JSON의 level 필드값
-    // domain=!{partitionKeyFromQuery:domain}: 로그 JSON의 domain 필드값
-    // year=!{timestamp:yyyy}: 전송 시간의 연도
-    // month=!{timestamp:MM}: 전송 시간의 월
-    // day=!{timestamp:dd}: 전송 시간의 일
-    const prefix =
-      `${config.s3.prefix}level=!{partitionKeyFromQuery:level}/` +
-      `domain=!{partitionKeyFromQuery:domain}/` +
-      `year=!{timestamp:yyyy}/` +
-      `month=!{timestamp:MM}/` +
-      `day=!{timestamp:dd}/`;
-
-    await firehose.send(
-      new CreateDeliveryStreamCommand({
-        DeliveryStreamName: streamName,
-        DeliveryStreamType: "DirectPut",
-        ExtendedS3DestinationConfiguration: {
-          // IAM 역할: Firehose가 S3와 Glue에 접근하기 위한 권한
-          RoleARN: roleArn,
-          // S3 버킷 ARN
-          BucketARN: bucketArn,
-          // Hive 파티셔닝 경로
-          Prefix: prefix,
-          // 에러가 발생한 레코드가 저장되는 경로
-          ErrorOutputPrefix: `${config.s3.prefix}errors/`,
-          // 버퍼링 설정: 이 조건 중 하나라도 충족되면 S3에 파일을 씁니다
-          BufferingHints: {
-            IntervalInSeconds: config.firehose.buffer_interval,
-            SizeInMBs: config.firehose.buffer_size,
-          },
-          // 압축: Parquet 자체에 압축이 포함되므로 UNCOMPRESSED
-          CompressionFormat: "UNCOMPRESSED",
-          // JSON -> Parquet 변환 설정
-          DataFormatConversionConfiguration: {
-            Enabled: true,
-            // 입력 포맷: JSON (CloudWatch Logs에서 오는 데이터)
-            InputFormatConfiguration: {
-              Deserializer: {
-                OpenXJsonSerDe: {},
-              },
-            },
-            // 출력 포맷: Parquet (S3에 저장되는 데이터)
-            OutputFormatConfiguration: {
-              Serializer: {
-                ParquetSerDe: {},
-              },
-            },
-            // 스키마 소스: Glue 테이블 (컬럼 이름과 타입을 여기서 참조)
-            SchemaConfiguration: {
-              RoleARN: roleArn,
-              DatabaseName: GLUE_DATABASE_NAME,
-              TableName: GLUE_TABLE_NAME,
-              Region: region,
-              VersionId: "LATEST",
-            },
-          },
-          // 동적 파티셔닝: 로그 필드값을 기반으로 S3 경로를 결정합니다
-          DynamicPartitioningConfiguration: {
-            Enabled: true,
-          },
-          // 파티션 키 추출을 위한 JQ 프로세서
-          // CloudWatch에서 온 JSON 로그에서 level, domain 필드를 추출합니다
-          ProcessingConfiguration: {
-            Enabled: true,
-            Processors: [
-              {
-                Type: "MetadataExtraction",
-                Parameters: [
-                  {
-                    ParameterName: "MetadataExtractionQuery",
-                    ParameterValue: '{level:.level, domain:.domain}',
-                  },
-                  {
-                    ParameterName: "JsonParsingEngine",
-                    ParameterValue: "JQ-1.6",
-                  },
-                ],
-              },
-            ],
-          },
-        },
-      })
-    );
-
-    return {
-      name: "Firehose Stream",
-      status: "created",
-      detail: `${streamName} (Parquet 변환 + Hive 파티셔닝 활성화)`,
-    };
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error);
-    return {
-      name: "Firehose Stream",
-      status: "failed",
-      detail: `${streamName} - ${message}`,
-    };
-  }
-}
-
-// =============================================================
-// (f) Athena 워크그룹 생성
+// (b) Athena 워크그룹 생성
 // =============================================================
 
 /**
@@ -872,6 +402,10 @@ async function createFirehoseStream(
  * - Athena 쿼리 실행 환경을 격리하는 단위입니다.
  * - 쿼리 결과 저장 위치, 스캔량 제한 등을 워크그룹 단위로 설정합니다.
  * - s3-logwatch 전용 워크그룹을 만들어 다른 Athena 사용과 분리합니다.
+ *
+ * 왜 DDL 실행 전에 워크그룹을 먼저 만드나?
+ * - CREATE DATABASE/TABLE DDL을 실행하려면 워크그룹이 필요합니다.
+ * - 워크그룹에 ResultConfiguration(결과 저장 위치)이 설정되어야 DDL 실행이 가능합니다.
  */
 async function createAthenaWorkgroup(
   athena: AthenaClient,
@@ -931,6 +465,377 @@ async function createAthenaWorkgroup(
       name: "Athena Workgroup",
       status: "failed",
       detail: `${workgroupName} - ${message}`,
+    };
+  }
+}
+
+// =============================================================
+// (c) Athena DDL로 데이터베이스 + 테이블 생성
+// =============================================================
+
+/**
+ * Athena DDL을 사용하여 데이터베이스와 테이블을 생성합니다.
+ *
+ * Glue SDK 대신 Athena DDL을 사용하는 이유:
+ * - CREATE EXTERNAL TABLE을 실행하면 내부적으로 Glue Data Catalog에 등록됩니다.
+ * - Glue SDK 의존성을 제거하여 번들 크기를 줄이고 코드를 단순화합니다.
+ * - IF NOT EXISTS를 사용하여 멱등성을 보장합니다.
+ *
+ * 실행 순서:
+ * 1. CREATE DATABASE IF NOT EXISTS - 데이터베이스 생성
+ * 2. CREATE EXTERNAL TABLE IF NOT EXISTS - 테이블 생성 (Partition Projection 포함)
+ */
+async function createAthenaTable(
+  athena: AthenaClient,
+  config: ReturnType<typeof loadConfig>
+): Promise<ResourceResult> {
+  const workgroup = config.athena.workgroup;
+  const outputLocation = config.athena.output_location;
+
+  try {
+    // 1단계: 데이터베이스 생성
+    // CREATE DATABASE IF NOT EXISTS로 이미 존재하면 무시됩니다
+    await executeAthenaDDL(
+      athena,
+      `CREATE DATABASE IF NOT EXISTS ${DATABASE_NAME}`,
+      workgroup,
+      outputLocation
+    );
+
+    // 2단계: 테이블 생성
+    // CREATE EXTERNAL TABLE IF NOT EXISTS로 이미 존재하면 무시됩니다
+    // Partition Projection TBLPROPERTIES가 포함되어 MSCK REPAIR TABLE 없이 파티션을 인식합니다
+    const createTableDDL = buildCreateTableDDL(config);
+    await executeAthenaDDL(athena, createTableDDL, workgroup, outputLocation);
+
+    return {
+      name: "Athena Table (via DDL)",
+      status: "created",
+      detail: `${DATABASE_NAME}.${TABLE_NAME} (Athena DDL로 생성, Glue Data Catalog에 자동 등록)`,
+    };
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      name: "Athena Table (via DDL)",
+      status: "failed",
+      detail: `${DATABASE_NAME}.${TABLE_NAME} - ${message}`,
+    };
+  }
+}
+
+// =============================================================
+// (d) IAM 역할 생성
+// =============================================================
+
+/**
+ * AWS 계정 ID를 가져오기 위한 헬퍼
+ *
+ * 왜 필요한가?
+ * - IAM 정책에서 S3 버킷 ARN, Glue 리소스 ARN을 지정할 때 계정 ID가 필요합니다.
+ * - STS GetCallerIdentity를 쓸 수도 있지만, 추가 패키지 의존성을 피하기 위해
+ *   IAM 정책에서는 와일드카드(*)를 사용하고 리소스 ARN으로 범위를 제한합니다.
+ *
+ * accountId가 비어있을 수 있으므로 Glue ARN에서 와일드카드를 사용합니다.
+ */
+async function getAccountIdFromBucketArn(
+  _bucketName: string,
+  _region: string
+): Promise<string> {
+  // STS 의존성을 추가하지 않기 위해 빈 문자열을 반환합니다.
+  // IAM 정책에서 계정 ID가 필요한 Glue ARN은 와일드카드(*)를 사용합니다.
+  return "";
+}
+
+/**
+ * Firehose용 IAM 역할을 생성합니다.
+ *
+ * IAM 역할이란?
+ * - AWS 서비스가 다른 AWS 서비스에 접근할 때 필요한 "신분증"입니다.
+ * - Firehose가 S3에 파일을 쓰려면 "S3에 쓸 수 있는 역할"이 필요합니다.
+ *
+ * Trust Policy (신뢰 정책):
+ * - "누가 이 역할을 사용할 수 있는가?"를 정의합니다.
+ * - firehose.amazonaws.com만 이 역할을 사용할 수 있도록 합니다.
+ *
+ * Inline Policy (인라인 정책):
+ * - "이 역할로 무엇을 할 수 있는가?"를 정의합니다.
+ * - S3: PutObject, GetObject, ListBucket (로그 파일 쓰기)
+ * - Glue: GetTable, GetDatabase (Athena DDL로 생성된 Glue 카탈로그 조회)
+ */
+async function createFirehoseIamRole(
+  iam: IAMClient,
+  bucketName: string,
+  region: string,
+  _accountId: string
+): Promise<ResourceResult> {
+  // 역할 존재 여부 확인
+  try {
+    await iam.send(new GetRoleCommand({ RoleName: FIREHOSE_ROLE_NAME }));
+    return {
+      name: "IAM Role",
+      status: "exists",
+      detail: `${FIREHOSE_ROLE_NAME} (이미 존재)`,
+    };
+  } catch (error: unknown) {
+    const errorName = (error as { name?: string })?.name ?? "";
+    if (errorName !== "NoSuchEntityException") {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        name: "IAM Role",
+        status: "failed",
+        detail: `${FIREHOSE_ROLE_NAME} - ${message}`,
+      };
+    }
+  }
+
+  try {
+    // Trust Policy: Firehose 서비스만 이 역할을 assume할 수 있습니다
+    const trustPolicy = {
+      Version: "2012-10-17",
+      Statement: [
+        {
+          Effect: "Allow",
+          Principal: {
+            Service: "firehose.amazonaws.com",
+          },
+          Action: "sts:AssumeRole",
+        },
+      ],
+    };
+
+    // 역할 생성
+    await iam.send(
+      new CreateRoleCommand({
+        RoleName: FIREHOSE_ROLE_NAME,
+        AssumeRolePolicyDocument: JSON.stringify(trustPolicy),
+        Description:
+          "s3-logwatch: Firehose가 S3에 로그를 쓰고 Glue 스키마를 조회하기 위한 역할",
+      })
+    );
+
+    // Inline Policy: S3 쓰기 + Glue 읽기 권한
+    // 왜 Managed Policy가 아닌 Inline Policy인가?
+    // - 이 역할에만 필요한 최소 권한을 정확히 정의하기 위해서입니다.
+    // - Managed Policy는 범용적이어서 불필요한 권한이 포함될 수 있습니다.
+    // 참고: Glue 권한은 여전히 필요합니다 (Athena DDL로 생성해도 Glue Data Catalog를 참조하므로)
+    const inlinePolicy = {
+      Version: "2012-10-17",
+      Statement: [
+        {
+          // S3 버킷에 로그 파일을 쓰는 권한
+          Sid: "S3Access",
+          Effect: "Allow",
+          Action: [
+            "s3:PutObject",
+            "s3:GetObject",
+            "s3:ListBucket",
+            "s3:GetBucketLocation",
+          ],
+          Resource: [
+            `arn:aws:s3:::${bucketName}`,
+            `arn:aws:s3:::${bucketName}/*`,
+          ],
+        },
+        {
+          // Glue 테이블 스키마를 조회하는 권한
+          // Athena DDL로 테이블을 만들어도 Glue Data Catalog에 등록되므로
+          // Firehose가 스키마를 참조할 때 Glue 읽기 권한이 필요합니다
+          Sid: "GlueAccess",
+          Effect: "Allow",
+          Action: [
+            "glue:GetTable",
+            "glue:GetTableVersion",
+            "glue:GetTableVersions",
+            "glue:GetDatabase",
+          ],
+          // Glue ARN은 계정 ID가 필요하지만, 와일드카드로 처리합니다
+          // 보안상 리소스 이름으로 범위를 충분히 제한합니다
+          Resource: [
+            `arn:aws:glue:${region}:*:catalog`,
+            `arn:aws:glue:${region}:*:database/${DATABASE_NAME}`,
+            `arn:aws:glue:${region}:*:table/${DATABASE_NAME}/${TABLE_NAME}`,
+          ],
+        },
+      ],
+    };
+
+    await iam.send(
+      new PutRolePolicyCommand({
+        RoleName: FIREHOSE_ROLE_NAME,
+        PolicyName: "s3-logwatch-firehose-policy",
+        PolicyDocument: JSON.stringify(inlinePolicy),
+      })
+    );
+
+    return {
+      name: "IAM Role",
+      status: "created",
+      detail: `${FIREHOSE_ROLE_NAME} (S3 PutObject + Glue GetTable 권한)`,
+    };
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      name: "IAM Role",
+      status: "failed",
+      detail: `${FIREHOSE_ROLE_NAME} - ${message}`,
+    };
+  }
+}
+
+// =============================================================
+// (e) Firehose Delivery Stream 생성
+// =============================================================
+
+/**
+ * Kinesis Data Firehose delivery stream을 생성합니다.
+ *
+ * Firehose란?
+ * - AWS의 스트리밍 데이터 전송 서비스입니다.
+ * - CloudWatch Logs에서 받은 JSON 로그를 S3에 저장합니다.
+ * - 버퍼링: 일정 시간(buffer_interval) 또는 크기(buffer_size)가 차면 S3에 씁니다.
+ *
+ * ExtendedS3DestinationConfiguration:
+ * - Firehose의 S3 출력 설정입니다.
+ * - Prefix: Hive 파티셔닝 경로 (domain=payment/...)
+ * - 동적 파티셔닝: JQ로 domain 필드를 추출하여 S3 경로에 사용
+ */
+async function createFirehoseStream(
+  firehose: FirehoseClient,
+  config: ReturnType<typeof loadConfig>,
+  region: string,
+  _accountId: string
+): Promise<ResourceResult> {
+  const streamName = config.firehose.delivery_stream;
+
+  // 존재 여부 확인
+  try {
+    await firehose.send(
+      new DescribeDeliveryStreamCommand({
+        DeliveryStreamName: streamName,
+      })
+    );
+    return {
+      name: "Firehose Stream",
+      status: "exists",
+      detail: `${streamName} (이미 존재)`,
+    };
+  } catch (error: unknown) {
+    const errorName = (error as { name?: string })?.name ?? "";
+    if (errorName !== "ResourceNotFoundException") {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        name: "Firehose Stream",
+        status: "failed",
+        detail: `${streamName} - ${message}`,
+      };
+    }
+  }
+
+  try {
+    // IAM 역할의 ARN을 조회합니다
+    // 왜 다시 조회하나? 역할이 이미 존재했을 수도, 방금 생성했을 수도 있으므로
+    // 항상 최신 ARN을 가져옵니다.
+    const roleResponse = await new IAMClient({ region }).send(
+      new GetRoleCommand({ RoleName: FIREHOSE_ROLE_NAME })
+    );
+    const roleArn = roleResponse.Role?.Arn;
+
+    if (!roleArn) {
+      return {
+        name: "Firehose Stream",
+        status: "failed",
+        detail: `${streamName} - IAM 역할 ARN을 가져올 수 없습니다. init-infra를 다시 실행해주세요.`,
+      };
+    }
+
+    const bucketArn = `arn:aws:s3:::${config.s3.bucket}`;
+
+    // 동적 파티셔닝 Prefix 설명:
+    // !{partitionKeyFromQuery:domain}: JQ로 추출한 domain 필드값 (예: "user", "order")
+    // !{timestamp:yyyy}: 전송 시간의 연도
+    // !{timestamp:MM}: 전송 시간의 월
+    // !{timestamp:dd}: 전송 시간의 일
+    const prefix =
+      `${config.s3.base_prefix}` +
+      `!{partitionKeyFromQuery:domain}/` +
+      `!{timestamp:yyyy}/` +
+      `!{timestamp:MM}/` +
+      `!{timestamp:dd}/`;
+
+    await firehose.send(
+      new CreateDeliveryStreamCommand({
+        DeliveryStreamName: streamName,
+        DeliveryStreamType: "DirectPut",
+        ExtendedS3DestinationConfiguration: {
+          // IAM 역할: Firehose가 S3와 Glue에 접근하기 위한 권한
+          RoleARN: roleArn,
+          // S3 버킷 ARN
+          BucketARN: bucketArn,
+          // Hive 파티셔닝 경로
+          Prefix: prefix,
+          // 에러가 발생한 레코드가 저장되는 경로
+          ErrorOutputPrefix: `${config.s3.base_prefix}errors/`,
+          // 버퍼링 설정: 이 조건 중 하나라도 충족되면 S3에 파일을 씁니다
+          BufferingHints: {
+            IntervalInSeconds: config.firehose.buffer_interval,
+            SizeInMBs: config.firehose.buffer_size,
+          },
+          // 압축: JSON 원본을 그대로 저장하므로 UNCOMPRESSED
+          CompressionFormat: "UNCOMPRESSED",
+          // 동적 파티셔닝: 로그 필드값을 기반으로 S3 경로를 결정합니다
+          DynamicPartitioningConfiguration: {
+            Enabled: true,
+          },
+          // 파티션 키 추출을 위한 JQ 프로세서 + 줄바꿈 구분자 추가
+          // CloudWatch에서 온 JSON 로그에서 domain 필드를 추출합니다
+          ProcessingConfiguration: {
+            Enabled: true,
+            Processors: [
+              {
+                // JQ를 사용하여 JSON 레코드에서 domain 필드를 추출합니다.
+                // 추출된 값은 동적 파티셔닝의 !{partitionKeyFromQuery:domain}에 매핑됩니다.
+                Type: "MetadataExtraction",
+                Parameters: [
+                  {
+                    ParameterName: "MetadataExtractionQuery",
+                    ParameterValue: "{domain:.domain}",
+                  },
+                  {
+                    ParameterName: "JsonParsingEngine",
+                    ParameterValue: "JQ-1.6",
+                  },
+                ],
+              },
+              {
+                // 각 레코드 끝에 줄바꿈(\n)을 추가합니다.
+                // 왜 필요한가? Firehose는 기본적으로 레코드를 구분자 없이 연결합니다.
+                // JSON Lines 포맷(한 줄에 하나의 JSON)을 유지하려면 줄바꿈이 필요합니다.
+                // Athena의 JSON SerDe가 각 줄을 독립적인 JSON으로 파싱합니다.
+                Type: "AppendDelimiterToRecord",
+                Parameters: [
+                  {
+                    ParameterName: "Delimiter",
+                    ParameterValue: "\\n",
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      })
+    );
+
+    return {
+      name: "Firehose Stream",
+      status: "created",
+      detail: `${streamName} (JSON 포맷 + 동적 파티셔닝 활성화)`,
+    };
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      name: "Firehose Stream",
+      status: "failed",
+      detail: `${streamName} - ${message}`,
     };
   }
 }
