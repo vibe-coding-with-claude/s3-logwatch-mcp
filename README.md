@@ -93,34 +93,77 @@ Claude Code를 프로젝트 디렉토리에서 실행하면 바로 사용 가능
 
 ### 사용법
 
-Claude Code를 열고 자연어로 대화하세요:
+프로젝트 디렉토리에서 Claude Code를 실행하세요:
 
 ```bash
-# 1. 인프라 초기화 (최초 1회)
+cd s3-logwatch-mcp
+claude
+```
+
+#### Step 1: 인프라 초기화 (최초 1회)
+
+```
 > "s3-logwatch 인프라 초기화해줘"
+```
 
-# 2. 로그 그룹 연결
-> "payment-api 로그 그룹 연결해줘"
-> "/ecs/auth-service 로그 그룹도 연결해줘, ERROR만 필터링해"
+S3 버킷, Athena 데이터베이스/테이블, Firehose, IAM 역할이 자동 생성됩니다.
+이미 존재하는 리소스는 스킵됩니다 (멱등성 보장).
 
-# 3. 로그 분석 (자연어 → Athena SQL 자동 생성)
-> "오늘 에러 로그 보여줘"
-> "지난 3일간 payment 도메인에서 가장 많이 발생한 에러 Top 5"
-> "auth 서비스의 timeout 에러가 언제부터 늘었어?"
+#### Step 2: 로그 그룹 연결 (도메인 지정 필수)
 
-# 4. 비용 확인
+```
+> "payment-api 로그 그룹 연결해줘, 도메인은 payment"
+> "/ecs/auth-service 로그 그룹 연결해줘, 도메인은 auth, ERROR만 필터링"
+> "/ecs/user-api 로그 그룹도 연결해줘, 도메인은 user"
+```
+
+각 로그 그룹이 어떤 도메인에 속하는지 반드시 지정해야 합니다.
+Firehose가 domain 필드를 기반으로 S3 경로를 자동 분기합니다:
+
+```
+s3://bucket/seungjae/payment/2026/03/28/
+s3://bucket/seungjae/auth/2026/03/28/
+s3://bucket/seungjae/user/2026/03/28/
+```
+
+#### Step 3: 로그 분석
+
+```
+> "오늘 payment 도메인에서 에러 몇 건이야?"
+> "user 도메인의 최근 3일 에러 Top 5 보여줘"
+> "order 도메인에서 timeout 에러가 언제부터 늘었어?"
+> "auth 도메인 3월 28일 로그 전부 보여줘"
+> "전체 도메인의 레벨별 로그 건수 집계해줘"
+```
+
+Claude가 자연어를 Athena SQL로 변환하여 실행합니다.
+도메인 조건(`WHERE domain='...'`)을 포함하면 해당 S3 경로만 스캔하여 비용이 절감됩니다.
+
+#### Step 4: 비용 확인
+
+```
 > "지금까지 쿼리 비용 얼마야?"
+```
+
+세션 내 모든 쿼리의 스캔량과 비용을 누적 조회합니다.
+
+#### Step 5: 설정 변경
+
+```
+> "현재 설정 보여줘"
+> "도메인에 billing 추가해줘, 경로는 seungjae/billing/"
+> "S3 버킷 이름 변경해줘"
 ```
 
 ## MCP 도구 목록
 
 | 도구 | 설명 | 자연어 예시 |
 |---|---|---|
-| `init-infra` | AWS 리소스 일괄 생성 | "인프라 초기화해줘" |
-| `connect-log-group` | CloudWatch Log Group 연결 | "payment-api 로그 그룹 연결해줘" |
-| `athena-query` | Athena SQL 실행 + 결과 반환 | "오늘 에러 로그 보여줘" |
+| `init-infra` | AWS 리소스 일괄 생성 (S3, Athena, Firehose, IAM) | "인프라 초기화해줘" |
+| `connect-log-group` | CloudWatch Log Group → Firehose 연결 | "payment-api 로그 그룹 연결해줘, 도메인은 payment" |
+| `athena-query` | Athena SQL 실행 + 결과 + 비용 표시 | "payment 도메인 에러 보여줘" |
 | `get-cost` | 세션 내 누적 쿼리 비용 조회 | "쿼리 비용 얼마야?" |
-| `update-config` | 설정 파일 조회/수정 | "S3 버킷 이름 변경해줘" |
+| `update-config` | 설정 파일 조회/수정 | "현재 설정 보여줘" |
 
 ## 설정
 
@@ -129,14 +172,42 @@ Claude Code를 열고 자연어로 대화하세요:
 ```yaml
 s3:
   bucket: s3-logwatch-logs
-  prefix: logs/
+  base_prefix: seungjae/          # S3 루트 경로
+
 firehose:
   delivery_stream: s3-logwatch-stream
-  buffer_interval: 300    # 초
-  buffer_size: 5          # MB
+  buffer_interval: 300            # 초 (5분)
+  buffer_size: 5                  # MB
+
 athena:
   workgroup: s3-logwatch
   output_location: s3://s3-logwatch-logs/athena-results/
+
+# 도메인별 S3 경로 — 각 도메인의 로그가 분리 저장됩니다
+domains:
+  - name: user
+    s3_prefix: seungjae/user/
+  - name: order
+    s3_prefix: seungjae/order/
+  - name: payment
+    s3_prefix: seungjae/payment/
+  - name: auth
+    s3_prefix: seungjae/auth/
+  - name: notification
+    s3_prefix: seungjae/notification/
+```
+
+### 도메인 추가 방법
+
+1. config.yaml의 `domains`에 항목 추가
+2. Athena 테이블의 partition projection이 자동 반영됨
+3. 새 도메인으로 로그 그룹 연결 가능
+
+```yaml
+# 예: billing 도메인 추가
+domains:
+  - name: billing
+    s3_prefix: seungjae/billing/
 ```
 
 ## 프로젝트 구조
@@ -270,34 +341,77 @@ Just run Claude Code from the project directory.
 
 ### Usage
 
-Open Claude Code and chat in natural language:
+Run Claude Code from the project directory:
 
 ```bash
-# 1. Initialize infrastructure (one-time)
+cd s3-logwatch-mcp
+claude
+```
+
+#### Step 1: Initialize Infrastructure (one-time)
+
+```
 > "Initialize s3-logwatch infrastructure"
+```
 
-# 2. Connect log groups
-> "Connect the payment-api log group"
-> "Connect /ecs/auth-service log group, filter ERROR only"
+Creates S3 bucket, Athena database/table, Firehose, and IAM roles.
+Already-existing resources are skipped (idempotent).
 
-# 3. Analyze logs (natural language → auto-generated Athena SQL)
-> "Show me today's error logs"
-> "Top 5 most frequent errors in payment domain over the last 3 days"
-> "When did timeout errors in auth service start increasing?"
+#### Step 2: Connect Log Groups (domain required)
 
-# 4. Check costs
+```
+> "Connect payment-api log group, domain is payment"
+> "Connect /ecs/auth-service log group, domain is auth, filter ERROR only"
+> "Connect /ecs/user-api log group, domain is user"
+```
+
+Each log group must specify which domain it belongs to.
+Firehose automatically routes logs to domain-specific S3 paths:
+
+```
+s3://bucket/seungjae/payment/2026/03/28/
+s3://bucket/seungjae/auth/2026/03/28/
+s3://bucket/seungjae/user/2026/03/28/
+```
+
+#### Step 3: Analyze Logs
+
+```
+> "How many errors in payment domain today?"
+> "Show top 5 errors in user domain over the last 3 days"
+> "When did timeout errors in order domain start increasing?"
+> "Show all auth domain logs from March 28"
+> "Aggregate log counts by level across all domains"
+```
+
+Claude converts natural language to Athena SQL.
+Including `WHERE domain='...'` scans only that domain's S3 path, reducing costs.
+
+#### Step 4: Check Costs
+
+```
 > "How much have queries cost so far?"
+```
+
+Shows cumulative scan volume and cost for all queries in the current session.
+
+#### Step 5: Manage Settings
+
+```
+> "Show current config"
+> "Add billing domain with path seungjae/billing/"
+> "Change S3 bucket name"
 ```
 
 ## MCP Tools
 
 | Tool | Description | Example |
 |---|---|---|
-| `init-infra` | Create all AWS resources | "Initialize infrastructure" |
-| `connect-log-group` | Connect CloudWatch Log Group | "Connect payment-api log group" |
-| `athena-query` | Execute Athena SQL + return results | "Show today's error logs" |
+| `init-infra` | Create all AWS resources (S3, Athena, Firehose, IAM) | "Initialize infrastructure" |
+| `connect-log-group` | Connect CloudWatch Log Group → Firehose | "Connect payment-api, domain is payment" |
+| `athena-query` | Execute Athena SQL + results + cost display | "Show payment domain errors" |
 | `get-cost` | View cumulative query costs | "How much did queries cost?" |
-| `update-config` | View/modify config file | "Change S3 bucket name" |
+| `update-config` | View/modify config file | "Show current config" |
 
 ## Configuration
 
@@ -306,14 +420,42 @@ Adjust settings in `~/.s3-logwatch/config.yaml`:
 ```yaml
 s3:
   bucket: s3-logwatch-logs
-  prefix: logs/
+  base_prefix: seungjae/          # S3 root path
+
 firehose:
   delivery_stream: s3-logwatch-stream
-  buffer_interval: 300    # seconds
-  buffer_size: 5          # MB
+  buffer_interval: 300            # seconds (5 min)
+  buffer_size: 5                  # MB
+
 athena:
   workgroup: s3-logwatch
   output_location: s3://s3-logwatch-logs/athena-results/
+
+# Domain-specific S3 paths — logs are stored separately per domain
+domains:
+  - name: user
+    s3_prefix: seungjae/user/
+  - name: order
+    s3_prefix: seungjae/order/
+  - name: payment
+    s3_prefix: seungjae/payment/
+  - name: auth
+    s3_prefix: seungjae/auth/
+  - name: notification
+    s3_prefix: seungjae/notification/
+```
+
+### Adding a New Domain
+
+1. Add an entry to `domains` in config.yaml
+2. Athena partition projection picks it up automatically
+3. Connect log groups with the new domain name
+
+```yaml
+# Example: add billing domain
+domains:
+  - name: billing
+    s3_prefix: seungjae/billing/
 ```
 
 ## Project Structure
