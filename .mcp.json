@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "s3-logwatch": {
+      "command": "npx",
+      "args": ["tsx", "/Users/seungjae/Desktop/work/mcp-server/src/index.ts"]
+    }
+  }
+}
