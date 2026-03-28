@@ -234,7 +234,7 @@ connections:
 | 로그 수집 | **CloudWatch Logs + Subscription Filter** | 기존 CloudWatch 로그와 자연스럽게 연동 |
 | 스트리밍 | **Kinesis Data Firehose** | Parquet 변환 내장, 실시간 수집 |
 | 저장 | **S3 (Hive Partitioning)** | 비용 최저, 무한 확장 |
-| 카탈로그 | **AWS Glue Data Catalog** | Athena 테이블 메타데이터 관리 |
+| 카탈로그 | **Athena DDL + Partition Projection** | Glue SDK 없이 Athena DDL로 테이블 생성, 파티션 자동 인식 |
 | 쿼리 | **Amazon Athena** | S3 직접 쿼리, 스캔량 기반 과금 |
 
 ### 이전 스택에서 제거된 항목
@@ -244,6 +244,7 @@ connections:
 | Go, Cobra, GoReleaser | MCP Server 전환으로 CLI 바이너리 불필요 |
 | Amazon Bedrock Agent + Action Group | Claude Code가 AI 역할을 대체 |
 | AWS Lambda | Bedrock Action Group 제거로 불필요 |
+| AWS Glue SDK (`@aws-sdk/client-glue`) | Athena DDL로 테이블 관리 가능, Glue SDK 의존성 제거 |
 
 ### TypeScript 선택 이유
 
@@ -260,9 +261,9 @@ connections:
 
 | 리소스 | 용도 |
 |--------|------|
-| **S3 버킷** | 로그 저장소 (Hive Partitioning) |
-| **Glue 데이터베이스 + 테이블** | Athena용 테이블 메타데이터 (파티션 키, 스키마 정의) |
-| **Kinesis Data Firehose delivery stream** | CloudWatch -> S3 스트리밍, Parquet 변환 |
+| **S3 버킷** | 로그 저장소 (도메인별 경로 파티셔닝) |
+| **Athena 데이터베이스 + 테이블** | DDL로 생성, Partition Projection으로 파티션 자동 인식 |
+| **Kinesis Data Firehose delivery stream** | CloudWatch -> S3 스트리밍, 도메인별 동적 파티셔닝 |
 | **Athena 워크그룹** | 쿼리 실행 환경, 스캔량 제한 설정 |
 | **IAM 역할들** | 각 서비스 간 권한 (Firehose -> S3 등) |
 

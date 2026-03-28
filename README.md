@@ -169,7 +169,8 @@ mcp-server/
 | AWS SDK | AWS SDK for JS v3 | TypeScript 네이티브 지원, 모듈별 분리 |
 | AI | Claude Code | MCP 클라이언트 역할, 별도 AI 서비스 불필요 |
 | 수집 | CloudWatch + Firehose | 기존 로그와 자연스럽게 연동 |
-| 저장 | S3 (Hive Partitioning) | 비용 최저, 무한 확장 |
+| 저장 | S3 (도메인별 경로 파티셔닝) | 비용 최저, 무한 확장 |
+| 카탈로그 | Athena DDL + Partition Projection | Glue SDK 없이 테이블 관리, 파티션 자동 인식 |
 | 쿼리 | Amazon Athena | S3 직접 쿼리, 스캔량 기반 과금 |
 
 ## 라이선스
@@ -345,7 +346,8 @@ mcp-server/
 | AWS SDK | AWS SDK for JS v3 | Native TypeScript support, modular |
 | AI | Claude Code | Acts as MCP client, no separate AI service needed |
 | Ingestion | CloudWatch + Firehose | Natural integration with existing logs |
-| Storage | S3 (Hive Partitioning) | Lowest cost, infinite scale |
+| Storage | S3 (domain-based path partitioning) | Lowest cost, infinite scale |
+| Catalog | Athena DDL + Partition Projection | No Glue SDK needed, auto partition discovery |
 | Query | Amazon Athena | Direct S3 query, pay-per-scan |
 
 ## License
