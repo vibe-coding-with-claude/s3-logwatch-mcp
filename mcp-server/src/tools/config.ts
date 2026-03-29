@@ -283,7 +283,7 @@ async function handleSet(path?: string, value?: string) {
 
     if (beforeDomainNames !== afterDomainNames) {
       const domainValues = updatedConfig.domains.map((d) => d.name).join(",");
-      const alterTableSQL = `ALTER TABLE ${updatedConfig.resource_names.database}.${updatedConfig.resource_names.table} SET TBLPROPERTIES ('projection.domain.values' = '${domainValues}')`;
+      const alterTableSQL = `ALTER TABLE ${updatedConfig.athena.database}.${updatedConfig.athena.table} SET TBLPROPERTIES ('projection.domain.values' = '${domainValues}')`;
 
       try {
         const athena = new AthenaClient({});

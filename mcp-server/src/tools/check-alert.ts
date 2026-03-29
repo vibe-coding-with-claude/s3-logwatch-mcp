@@ -93,7 +93,7 @@ async function handleCheckAlerts(region?: string) {
 
   // 각 규칙을 순차적으로 체크
   for (const rule of config.alerts.rules) {
-    const result = await checkRule(athena, config.athena.workgroup, config.athena.output_location, config.resource_names.database, rule);
+    const result = await checkRule(athena, config.athena.workgroup, config.athena.output_location, config.athena.database, rule);
     results.push(result);
   }
 

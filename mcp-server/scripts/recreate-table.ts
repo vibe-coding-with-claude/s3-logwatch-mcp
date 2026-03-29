@@ -25,9 +25,9 @@ const REGION = process.env.E2E_REGION ?? loadConfig().region;
 const athena = new AthenaClient({ region: REGION });
 
 /** 데이터베이스 이름 (config에서 로드) */
-const DATABASE_NAME = config.resource_names.database;
+const DATABASE_NAME = config.athena.database;
 /** 테이블 이름 (config에서 로드) */
-const TABLE_NAME = config.resource_names.table;
+const TABLE_NAME = config.athena.table;
 
 /**
  * Athena DDL을 실행하고 완료까지 폴링합니다.

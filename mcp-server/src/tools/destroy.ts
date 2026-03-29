@@ -459,8 +459,8 @@ async function deleteAthenaResources(
   const workgroup = config.athena.workgroup;
   const outputLocation = config.athena.output_location;
 
-  const dbName = config.resource_names.database;
-  const tblName = config.resource_names.table;
+  const dbName = config.athena.database;
+  const tblName = config.athena.table;
 
   try {
     // 워크그룹 존재 여부 먼저 확인 (워크그룹이 없으면 DDL 실행 불가)

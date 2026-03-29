@@ -227,8 +227,8 @@ export async function executeAthenaDDL(
  */
 export function buildCreateTableDDL(config: ReturnType<typeof loadConfig>): string {
   // config.resource_names에서 데이터베이스/테이블 이름을 가져옵니다
-  const DATABASE_NAME = config.resource_names.database;
-  const TABLE_NAME = config.resource_names.table;
+  const DATABASE_NAME = config.athena.database;
+  const TABLE_NAME = config.athena.table;
 
   // config.domains에서 도메인 이름 목록을 추출하여 쉼표로 연결
   const domainValues = config.domains.map(d => d.name).join(",");
@@ -639,8 +639,8 @@ async function createAthenaTable(
   const outputLocation = config.athena.output_location;
 
   try {
-    const dbName = config.resource_names.database;
-    const tblName = config.resource_names.table;
+    const dbName = config.athena.database;
+    const tblName = config.athena.table;
 
     // 1단계: 데이터베이스 생성
     // CREATE DATABASE IF NOT EXISTS로 이미 존재하면 무시됩니다
@@ -667,7 +667,7 @@ async function createAthenaTable(
     return {
       name: "Athena Table (via DDL)",
       status: "failed",
-      detail: `${config.resource_names.database}.${config.resource_names.table} - ${message}`,
+      detail: `${config.athena.database}.${config.athena.table} - ${message}`,
     };
   }
 }
@@ -718,8 +718,8 @@ async function createFirehoseIamRole(
   _accountId: string
 ): Promise<ResourceResult> {
   const FIREHOSE_ROLE_NAME = config.resource_names.firehose_role;
-  const DATABASE_NAME = config.resource_names.database;
-  const TABLE_NAME = config.resource_names.table;
+  const DATABASE_NAME = config.athena.database;
+  const TABLE_NAME = config.athena.table;
   const bucketName = config.s3.bucket;
 
   // 역할 존재 여부 확인
@@ -1090,8 +1090,8 @@ async function createFirehoseStream(
 ): Promise<ResourceResult> {
   const streamName = config.firehose.delivery_stream;
   const FIREHOSE_ROLE_NAME = config.resource_names.firehose_role;
-  const DATABASE_NAME = config.resource_names.database;
-  const TABLE_NAME = config.resource_names.table;
+  const DATABASE_NAME = config.athena.database;
+  const TABLE_NAME = config.athena.table;
 
   // 존재 여부 확인
   try {

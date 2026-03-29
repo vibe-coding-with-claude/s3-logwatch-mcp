@@ -120,6 +120,8 @@ export interface PartitionConfig {
 export interface AthenaConfig {
   workgroup: string;
   output_location: string;
+  database: string;   // Athena 데이터베이스 이름 (기본: s3_logwatch)
+  table: string;      // Athena 테이블 이름 (기본: logs)
 }
 
 /**
@@ -180,8 +182,6 @@ export interface ConnectionConfig {
  * 사용자가 모든 리소스 이름을 자유롭게 변경할 수 있습니다.
  */
 export interface ResourceNamesConfig {
-  database: string;                   // Athena 데이터베이스 이름 (기본: s3_logwatch)
-  table: string;                      // Athena 테이블 이름 (기본: logs)
   firehose_role: string;              // Firehose IAM 역할 (기본: s3-logwatch-firehose-role)
   lambda_role: string;                // Lambda IAM 역할 (기본: s3-logwatch-lambda-role)
   lambda_function: string;            // Lambda 함수 이름 (기본: s3-logwatch-transformer)
@@ -245,10 +245,10 @@ export const DEFAULT_CONFIG: AppConfig = {
   athena: {
     workgroup: "s3-logwatch",
     output_location: "s3://s3-logwatch-logs-ap2/athena-results/",
-  },
-  resource_names: {
     database: "s3_logwatch",
     table: "logs",
+  },
+  resource_names: {
     firehose_role: "s3-logwatch-firehose-role",
     lambda_role: "s3-logwatch-lambda-role",
     lambda_function: "s3-logwatch-transformer",

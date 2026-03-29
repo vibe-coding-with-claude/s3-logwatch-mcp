@@ -47,8 +47,8 @@ import { loadConfig } from "../src/config.js";
 const REGION = process.env.E2E_REGION ?? loadConfig().region;
 const config = loadConfig();
 
-const DATABASE_NAME = config.resource_names.database;
-const TABLE_NAME = config.resource_names.table;
+const DATABASE_NAME = config.athena.database;
+const TABLE_NAME = config.athena.table;
 const FIREHOSE_ROLE_NAME = config.resource_names.firehose_role;
 const LAMBDA_ROLE_NAME = config.resource_names.lambda_role;
 const LAMBDA_FUNCTION_NAME = config.resource_names.lambda_function;
