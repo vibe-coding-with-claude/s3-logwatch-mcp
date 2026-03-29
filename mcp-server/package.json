@@ -7,20 +7,24 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "e2e": "tsx scripts/e2e-test.ts"
+    "e2e": "tsx scripts/e2e-test.ts",
+    "test": "vitest run"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1",
-    "@aws-sdk/client-s3": "^3.700.0",
     "@aws-sdk/client-athena": "^3.700.0",
+    "@aws-sdk/client-cloudwatch-logs": "^3.700.0",
     "@aws-sdk/client-firehose": "^3.700.0",
     "@aws-sdk/client-iam": "^3.700.0",
-    "@aws-sdk/client-cloudwatch-logs": "^3.700.0",
-    "yaml": "^2.7.0"
+    "@aws-sdk/client-lambda": "^3.1019.0",
+    "@aws-sdk/client-s3": "^3.700.0",
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "yaml": "^2.7.0",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
-    "typescript": "^5.7.0",
+    "@types/node": "^22.10.0",
     "tsx": "^4.19.0",
-    "@types/node": "^22.10.0"
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.4"
   }
 }
