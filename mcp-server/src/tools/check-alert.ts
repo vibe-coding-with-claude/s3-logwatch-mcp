@@ -21,7 +21,6 @@ import {
 // 상수
 // =============================================================
 
-const GLUE_DATABASE_NAME = "s3_logwatch";
 const POLL_INTERVAL_MS = 1000;
 const MAX_WAIT_MS = 60000;
 
@@ -94,7 +93,7 @@ async function handleCheckAlerts(region?: string) {
 
   // 각 규칙을 순차적으로 체크
   for (const rule of config.alerts.rules) {
-    const result = await checkRule(athena, config.athena.workgroup, config.athena.output_location, rule);
+    const result = await checkRule(athena, config.athena.workgroup, config.athena.output_location, config.resource_names.database, rule);
     results.push(result);
   }
 
@@ -123,6 +122,7 @@ async function checkRule(
   athena: AthenaClient,
   workgroup: string,
   outputLocation: string,
+  databaseName: string,
   rule: AlertRule
 ): Promise<RuleCheckResult> {
   const sql = buildCountQuery(rule);
@@ -135,7 +135,7 @@ async function checkRule(
       new StartQueryExecutionCommand({
         QueryString: sql,
         WorkGroup: workgroup,
-        QueryExecutionContext: { Database: GLUE_DATABASE_NAME },
+        QueryExecutionContext: { Database: databaseName },
         ResultConfiguration: { OutputLocation: outputLocation },
       })
     );

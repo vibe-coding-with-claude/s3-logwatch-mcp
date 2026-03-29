@@ -175,6 +175,19 @@ export interface ConnectionConfig {
  * - 설정 파일의 전체 구조를 한눈에 파악할 수 있습니다.
  * - 함수 간에 설정을 전달할 때 타입 안전성을 보장합니다.
  */
+/**
+ * AWS 리소스 이름 설정
+ * 사용자가 모든 리소스 이름을 자유롭게 변경할 수 있습니다.
+ */
+export interface ResourceNamesConfig {
+  database: string;                   // Athena 데이터베이스 이름 (기본: s3_logwatch)
+  table: string;                      // Athena 테이블 이름 (기본: logs)
+  firehose_role: string;              // Firehose IAM 역할 (기본: s3-logwatch-firehose-role)
+  lambda_role: string;                // Lambda IAM 역할 (기본: s3-logwatch-lambda-role)
+  lambda_function: string;            // Lambda 함수 이름 (기본: s3-logwatch-transformer)
+  cwl_to_firehose_role: string;       // CW→Firehose IAM 역할 (기본: s3-logwatch-cwl-to-firehose-role)
+}
+
 export interface AppConfig {
   /** AWS 리전 (기본값: ap-northeast-2). 사용자가 config.yaml에서 변경 가능. */
   region: string;
@@ -183,6 +196,8 @@ export interface AppConfig {
   schema: SchemaConfig;
   partitioning: PartitionConfig;
   athena: AthenaConfig;
+  /** AWS 리소스 이름. 모든 이름을 사용자가 변경 가능. */
+  resource_names: ResourceNamesConfig;
   /** 도메인별 S3 경로 목록. 각 도메인은 독립적인 S3 prefix를 가집니다. */
   domains: DomainConfig[];
   connections: ConnectionConfig[];
@@ -230,6 +245,14 @@ export const DEFAULT_CONFIG: AppConfig = {
   athena: {
     workgroup: "s3-logwatch",
     output_location: "s3://s3-logwatch-logs-ap2/athena-results/",
+  },
+  resource_names: {
+    database: "s3_logwatch",
+    table: "logs",
+    firehose_role: "s3-logwatch-firehose-role",
+    lambda_role: "s3-logwatch-lambda-role",
+    lambda_function: "s3-logwatch-transformer",
+    cwl_to_firehose_role: "s3-logwatch-cwl-to-firehose-role",
   },
   // 도메인별 S3 경로: 각 도메인의 로그가 독립적인 S3 경로에 저장됩니다.
   domains: [
@@ -474,6 +497,10 @@ export function mergeWithDefaults(partial: Partial<AppConfig>): AppConfig {
     athena: {
       ...DEFAULT_CONFIG.athena,
       ...(partial.athena ?? {}),
+    },
+    resource_names: {
+      ...DEFAULT_CONFIG.resource_names,
+      ...(partial.resource_names ?? {}),
     },
     // 도메인 목록 병합: 사용자가 지정했으면 그대로 사용, 없으면 기본값
     // 왜 배열을 통째로 대체하나?

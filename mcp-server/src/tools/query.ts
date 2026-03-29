@@ -38,13 +38,7 @@ import {
   GetQueryResultsCommand,
 } from "@aws-sdk/client-athena";
 
-// =============================================================
-// Glue 데이터베이스 이름 상수
-// =============================================================
-// init-infra 도구에서 생성한 Glue 데이터베이스와 동일한 이름을 사용합니다.
-// Athena는 Glue 데이터 카탈로그를 메타스토어로 사용하므로,
-// 쿼리 시 어떤 데이터베이스의 테이블인지 지정해야 합니다.
-const GLUE_DATABASE_NAME = "s3_logwatch";
+// Glue 데이터베이스 이름은 config.resource_names.database에서 로드됩니다.
 
 // =============================================================
 // 쿼리 비용 추적용 타입과 모듈 레벨 변수
@@ -163,7 +157,7 @@ export function registerQueryTool(server: McpServer): void {
   const toolDescription = [
     "Execute an Athena SQL query on s3-logwatch log data.",
     "",
-    `Database: ${GLUE_DATABASE_NAME}`,
+    `Database: ${config.resource_names.database}`,
     "Table: logs",
     "",
     `Columns: ${columnDescriptions}`,
@@ -280,7 +274,7 @@ async function executeQuery(sql: string, region?: string) {
       WorkGroup: config.athena.workgroup,
       // 쿼리 컨텍스트: 어떤 Glue 데이터베이스를 사용할지 지정
       QueryExecutionContext: {
-        Database: GLUE_DATABASE_NAME,
+        Database: config.resource_names.database,
       },
       // 결과 저장 위치: 쿼리 결과가 CSV로 저장되는 S3 경로
       ResultConfiguration: {

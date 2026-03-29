@@ -50,15 +50,7 @@ import {
 // 상수 정의
 // =============================================================
 
-/**
- * CloudWatch Logs -> Firehose 전달을 위한 IAM 역할 이름
- *
- * 왜 Firehose용 역할과 별도로 만드나?
- * - init-infra에서 만든 역할은 "Firehose -> S3/Glue" 권한입니다.
- * - 이 역할은 "CloudWatch Logs -> Firehose" 권한으로, 주체(Principal)가 다릅니다.
- * - AWS IAM 모범사례: 서비스마다 최소 권한의 별도 역할을 부여합니다.
- */
-const CWL_TO_FIREHOSE_ROLE_NAME = "s3-logwatch-cwl-to-firehose-role";
+// CWL_TO_FIREHOSE_ROLE_NAME은 config.resource_names.cwl_to_firehose_role에서 로드됩니다.
 
 // =============================================================
 // 입력 파라미터 스키마
@@ -233,6 +225,7 @@ async function connectLogGroup(
   const config = loadConfig();
   const resolvedRegion = region ?? config.region;
   const resolvedFilterPattern = filterPattern ?? "";
+  const CWL_TO_FIREHOSE_ROLE_NAME = config.resource_names.cwl_to_firehose_role;
 
   // --- (1) config.yaml에서 Firehose delivery stream 이름 가져오기 ---
   // 왜 config에서 읽나? init-infra에서 생성한 Firehose 이름을 일관되게 사용하기 위해서입니다.
@@ -275,7 +268,8 @@ async function connectLogGroup(
   const roleArn = await ensureCwlToFirehoseRole(
     iamClient,
     firehoseArn,
-    resolvedRegion
+    resolvedRegion,
+    CWL_TO_FIREHOSE_ROLE_NAME
   );
 
   // --- (4) Subscription Filter 생성 ---
@@ -398,7 +392,8 @@ async function getFirehoseArn(
 async function ensureCwlToFirehoseRole(
   client: IAMClient,
   firehoseArn: string,
-  region: string
+  region: string,
+  CWL_TO_FIREHOSE_ROLE_NAME: string
 ): Promise<string> {
   // 먼저 역할이 이미 존재하는지 확인합니다
   try {
@@ -410,7 +405,7 @@ async function ensureCwlToFirehoseRole(
       // 역할이 이미 존재하면 정책만 업데이트합니다
       // 왜 정책을 업데이트하나? 새로운 Firehose ARN이 추가되었을 수 있기 때문입니다.
       // PutRolePolicy는 같은 PolicyName이면 덮어씌우는 upsert 동작입니다.
-      await putFirehosePermissionPolicy(client, firehoseArn);
+      await putFirehosePermissionPolicy(client, firehoseArn, CWL_TO_FIREHOSE_ROLE_NAME);
       return arn;
     }
   } catch (error: unknown) {
@@ -454,7 +449,7 @@ async function ensureCwlToFirehoseRole(
   }
 
   // Inline Policy 추가: Firehose에 데이터를 쓸 수 있는 권한
-  await putFirehosePermissionPolicy(client, firehoseArn);
+  await putFirehosePermissionPolicy(client, firehoseArn, CWL_TO_FIREHOSE_ROLE_NAME);
 
   return roleArn;
 }
@@ -475,7 +470,8 @@ async function ensureCwlToFirehoseRole(
  */
 async function putFirehosePermissionPolicy(
   client: IAMClient,
-  firehoseArn: string
+  firehoseArn: string,
+  CWL_TO_FIREHOSE_ROLE_NAME: string
 ): Promise<void> {
   const inlinePolicy = {
     Version: "2012-10-17",

@@ -47,11 +47,11 @@ import { loadConfig } from "../src/config.js";
 const REGION = process.env.E2E_REGION ?? loadConfig().region;
 const config = loadConfig();
 
-const DATABASE_NAME = "s3_logwatch";
-const TABLE_NAME = "logs";
-const FIREHOSE_ROLE_NAME = "s3-logwatch-firehose-role";
-const LAMBDA_ROLE_NAME = "s3-logwatch-lambda-role";
-const LAMBDA_FUNCTION_NAME = "s3-logwatch-transformer";
+const DATABASE_NAME = config.resource_names.database;
+const TABLE_NAME = config.resource_names.table;
+const FIREHOSE_ROLE_NAME = config.resource_names.firehose_role;
+const LAMBDA_ROLE_NAME = config.resource_names.lambda_role;
+const LAMBDA_FUNCTION_NAME = config.resource_names.lambda_function;
 
 /**
  * 지정된 밀리초만큼 대기합니다.

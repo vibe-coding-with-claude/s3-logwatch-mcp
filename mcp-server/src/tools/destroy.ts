@@ -76,20 +76,8 @@ interface DestroyResult {
 }
 
 // =============================================================
-// 상수 정의
+// 상수 정의 (resource_names는 config에서 로드)
 // =============================================================
-
-/** Athena/Glue 데이터베이스 이름 (init.ts와 동일) */
-const DATABASE_NAME = "s3_logwatch";
-
-/** Athena/Glue 테이블 이름 (init.ts와 동일) */
-const TABLE_NAME = "logs";
-
-/** Firehose용 IAM 역할 이름 (init.ts와 동일) */
-const FIREHOSE_ROLE_NAME = "s3-logwatch-firehose-role";
-
-/** CloudWatch Logs -> Firehose 전달을 위한 IAM 역할 이름 (connect.ts와 동일) */
-const CWL_TO_FIREHOSE_ROLE_NAME = "s3-logwatch-cwl-to-firehose-role";
 
 // =============================================================
 // 입력 파라미터 스키마
@@ -210,8 +198,8 @@ async function destroyInfra(
 
   // --- (3) IAM 역할 삭제 ---
   // Firehose용 역할과 CWL->Firehose 전달용 역할 두 개를 삭제합니다.
-  results.push(await deleteIamRole(iamClient, FIREHOSE_ROLE_NAME));
-  results.push(await deleteIamRole(iamClient, CWL_TO_FIREHOSE_ROLE_NAME));
+  results.push(await deleteIamRole(iamClient, config.resource_names.firehose_role));
+  results.push(await deleteIamRole(iamClient, config.resource_names.cwl_to_firehose_role));
 
   // --- (4) Athena 테이블/데이터베이스 삭제 ---
   results.push(await deleteAthenaResources(athenaClient, config));
@@ -471,6 +459,9 @@ async function deleteAthenaResources(
   const workgroup = config.athena.workgroup;
   const outputLocation = config.athena.output_location;
 
+  const dbName = config.resource_names.database;
+  const tblName = config.resource_names.table;
+
   try {
     // 워크그룹 존재 여부 먼저 확인 (워크그룹이 없으면 DDL 실행 불가)
     try {
@@ -482,14 +473,14 @@ async function deleteAthenaResources(
       return {
         name: "Athena Table/Database",
         status: "not_found",
-        detail: `${DATABASE_NAME}.${TABLE_NAME} (워크그룹 없음, 이미 삭제된 것으로 간주)`,
+        detail: `${dbName}.${tblName} (워크그룹 없음, 이미 삭제된 것으로 간주)`,
       };
     }
 
     // 테이블 삭제
     await executeAthenaDDL(
       athenaClient,
-      `DROP TABLE IF EXISTS ${DATABASE_NAME}.${TABLE_NAME}`,
+      `DROP TABLE IF EXISTS ${dbName}.${tblName}`,
       workgroup,
       outputLocation
     );
@@ -497,7 +488,7 @@ async function deleteAthenaResources(
     // 데이터베이스 삭제
     await executeAthenaDDL(
       athenaClient,
-      `DROP DATABASE IF EXISTS ${DATABASE_NAME}`,
+      `DROP DATABASE IF EXISTS ${dbName}`,
       workgroup,
       outputLocation
     );
@@ -505,14 +496,14 @@ async function deleteAthenaResources(
     return {
       name: "Athena Table/Database",
       status: "deleted",
-      detail: `${DATABASE_NAME}.${TABLE_NAME} (DDL DROP 실행)`,
+      detail: `${dbName}.${tblName} (DDL DROP 실행)`,
     };
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     return {
       name: "Athena Table/Database",
       status: "failed",
-      detail: `${DATABASE_NAME}.${TABLE_NAME} - ${message}`,
+      detail: `${dbName}.${tblName} - ${message}`,
     };
   }
 }

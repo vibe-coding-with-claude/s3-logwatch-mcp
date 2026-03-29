@@ -100,23 +100,8 @@ interface ResourceResult {
 }
 
 // =============================================================
-// 상수 정의
+// 상수 정의 (resource_names는 config에서 로드)
 // =============================================================
-
-/** Athena/Glue 데이터베이스 이름. Glue는 하이픈을 허용하지 않으므로 언더스코어를 사용합니다. */
-const DATABASE_NAME = "s3_logwatch";
-
-/** Athena/Glue 테이블 이름 */
-const TABLE_NAME = "logs";
-
-/** Firehose용 IAM 역할 이름 */
-const FIREHOSE_ROLE_NAME = "s3-logwatch-firehose-role";
-
-/** Lambda 변환 함수 이름 */
-const LAMBDA_FUNCTION_NAME = "s3-logwatch-transformer";
-
-/** Lambda용 IAM 역할 이름 */
-const LAMBDA_ROLE_NAME = "s3-logwatch-lambda-role";
 
 // =============================================================
 // 입력 파라미터 스키마
@@ -241,6 +226,10 @@ export async function executeAthenaDDL(
  * @returns CREATE EXTERNAL TABLE IF NOT EXISTS DDL 문자열
  */
 export function buildCreateTableDDL(config: ReturnType<typeof loadConfig>): string {
+  // config.resource_names에서 데이터베이스/테이블 이름을 가져옵니다
+  const DATABASE_NAME = config.resource_names.database;
+  const TABLE_NAME = config.resource_names.table;
+
   // config.domains에서 도메인 이름 목록을 추출하여 쉼표로 연결
   const domainValues = config.domains.map(d => d.name).join(",");
 
@@ -338,14 +327,14 @@ async function initInfra(region?: string): Promise<ResourceResult[]> {
   // --- (d) IAM 역할 생성 ---
   const accountId = await getAccountIdFromBucketArn(config.s3.bucket, resolvedRegion);
   results.push(
-    await createFirehoseIamRole(iam, config.s3.bucket, resolvedRegion, accountId)
+    await createFirehoseIamRole(iam, config, resolvedRegion, accountId)
   );
 
   // --- (d-2) Lambda용 IAM 역할 생성 ---
   // Lambda 변환 함수가 CloudWatch Logs를 쓰기 위한 역할입니다.
   const lambda = new LambdaClient({ region: resolvedRegion });
   results.push(
-    await createLambdaIamRole(iam, resolvedRegion)
+    await createLambdaIamRole(iam, config, resolvedRegion)
   );
 
   // --- (d-3) Lambda 변환 함수 생성 ---
@@ -361,7 +350,7 @@ async function initInfra(region?: string): Promise<ResourceResult[]> {
   let lambdaArn: string | undefined;
   try {
     const lambdaInfo = await lambda.send(
-      new GetFunctionCommand({ FunctionName: LAMBDA_FUNCTION_NAME })
+      new GetFunctionCommand({ FunctionName: config.resource_names.lambda_function })
     );
     lambdaArn = lambdaInfo.Configuration?.FunctionArn;
   } catch {
@@ -650,11 +639,14 @@ async function createAthenaTable(
   const outputLocation = config.athena.output_location;
 
   try {
+    const dbName = config.resource_names.database;
+    const tblName = config.resource_names.table;
+
     // 1단계: 데이터베이스 생성
     // CREATE DATABASE IF NOT EXISTS로 이미 존재하면 무시됩니다
     await executeAthenaDDL(
       athena,
-      `CREATE DATABASE IF NOT EXISTS ${DATABASE_NAME}`,
+      `CREATE DATABASE IF NOT EXISTS ${dbName}`,
       workgroup,
       outputLocation
     );
@@ -668,14 +660,14 @@ async function createAthenaTable(
     return {
       name: "Athena Table (via DDL)",
       status: "created",
-      detail: `${DATABASE_NAME}.${TABLE_NAME} (Athena DDL로 생성, Glue Data Catalog에 자동 등록)`,
+      detail: `${dbName}.${tblName} (Athena DDL로 생성, Glue Data Catalog에 자동 등록)`,
     };
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
     return {
       name: "Athena Table (via DDL)",
       status: "failed",
-      detail: `${DATABASE_NAME}.${TABLE_NAME} - ${message}`,
+      detail: `${config.resource_names.database}.${config.resource_names.table} - ${message}`,
     };
   }
 }
@@ -721,10 +713,15 @@ async function getAccountIdFromBucketArn(
  */
 async function createFirehoseIamRole(
   iam: IAMClient,
-  bucketName: string,
+  config: ReturnType<typeof loadConfig>,
   region: string,
   _accountId: string
 ): Promise<ResourceResult> {
+  const FIREHOSE_ROLE_NAME = config.resource_names.firehose_role;
+  const DATABASE_NAME = config.resource_names.database;
+  const TABLE_NAME = config.resource_names.table;
+  const bucketName = config.s3.bucket;
+
   // 역할 존재 여부 확인
   try {
     await iam.send(new GetRoleCommand({ RoleName: FIREHOSE_ROLE_NAME }));
@@ -851,8 +848,11 @@ async function createFirehoseIamRole(
  */
 async function createLambdaIamRole(
   iam: IAMClient,
+  config: ReturnType<typeof loadConfig>,
   _region: string
 ): Promise<ResourceResult> {
+  const LAMBDA_ROLE_NAME = config.resource_names.lambda_role;
+
   try {
     await iam.send(new GetRoleCommand({ RoleName: LAMBDA_ROLE_NAME }));
     return {
@@ -953,6 +953,9 @@ async function createLambdaFunction(
   config: ReturnType<typeof loadConfig>,
   _region: string
 ): Promise<ResourceResult> {
+  const LAMBDA_FUNCTION_NAME = config.resource_names.lambda_function;
+  const LAMBDA_ROLE_NAME = config.resource_names.lambda_role;
+
   try {
     await lambda.send(
       new GetFunctionCommand({ FunctionName: LAMBDA_FUNCTION_NAME })
@@ -1086,6 +1089,9 @@ async function createFirehoseStream(
   lambdaArn?: string
 ): Promise<ResourceResult> {
   const streamName = config.firehose.delivery_stream;
+  const FIREHOSE_ROLE_NAME = config.resource_names.firehose_role;
+  const DATABASE_NAME = config.resource_names.database;
+  const TABLE_NAME = config.resource_names.table;
 
   // 존재 여부 확인
   try {
