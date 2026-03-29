@@ -24,6 +24,8 @@ import {
   saveConfig,
   validateConfig,
 } from "../config.js";
+import { executeAthenaDDL } from "./init.js";
+import { AthenaClient } from "@aws-sdk/client-athena";
 
 // =============================================================
 // 입력 파라미터 스키마 (zod)
@@ -195,7 +197,7 @@ function handleGet(path?: string) {
  * 5. 수정된 설정 검증
  * 6. 검증 통과하면 저장
  */
-function handleSet(path?: string, value?: string) {
+async function handleSet(path?: string, value?: string) {
   // 필수 파라미터 확인
   if (!path) {
     return {
@@ -236,6 +238,12 @@ function handleSet(path?: string, value?: string) {
   // 현재 설정 로드
   const config = loadConfig();
 
+  // 도메인 변경 감지를 위해 변경 전 도메인 목록을 저장
+  const isDomainPath = path.startsWith("domains");
+  const beforeDomainNames = isDomainPath
+    ? config.domains.map((d) => d.name).sort().join(",")
+    : "";
+
   // 해당 경로에 값 설정
   const success = setNestedValue(config as unknown as Record<string, unknown>, path, parsedValue);
   if (!success) {
@@ -264,8 +272,50 @@ function handleSet(path?: string, value?: string) {
     };
   }
 
-  // 저장
+  // 저장 (도메인 변경 감지 전에 먼저 저장 — 실패해도 설정은 유지됨)
   saveConfig(config);
+
+  // 도메인 변경 감지: path가 "domains"로 시작하면 도메인 변경으로 간주
+  if (isDomainPath) {
+    // 최신 config에서 domains를 읽어 projection 값 생성
+    const updatedConfig = loadConfig();
+    const afterDomainNames = updatedConfig.domains.map((d) => d.name).sort().join(",");
+
+    if (beforeDomainNames !== afterDomainNames) {
+      const domainValues = updatedConfig.domains.map((d) => d.name).join(",");
+      const alterTableSQL = `ALTER TABLE s3_logwatch.logs SET TBLPROPERTIES ('projection.domain.values' = '${domainValues}')`;
+
+      try {
+        const athena = new AthenaClient({});
+        await executeAthenaDDL(
+          athena,
+          alterTableSQL,
+          updatedConfig.athena.workgroup,
+          updatedConfig.athena.output_location
+        );
+
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `설정이 업데이트되었습니다.\n\n${path} = ${JSON.stringify(parsedValue, null, 2)}\n\nAthena 테이블의 projection.domain.values가 자동으로 갱신되었습니다: ${domainValues}`,
+            },
+          ],
+        };
+      } catch (athenaError: unknown) {
+        const athenaMessage =
+          athenaError instanceof Error ? athenaError.message : "알 수 없는 Athena 오류";
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `설정은 저장되었지만, Athena 테이블 갱신에 실패했습니다: ${athenaMessage}\n\n수동으로 다음 SQL을 실행하세요:\n${alterTableSQL}\n\n${path} = ${JSON.stringify(parsedValue, null, 2)}`,
+            },
+          ],
+        };
+      }
+    }
+  }
 
   return {
     content: [
