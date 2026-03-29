@@ -21,7 +21,7 @@ import {
 import { loadConfig } from "../src/config.js";
 
 const config = loadConfig();
-const REGION = process.env.E2E_REGION ?? "us-east-1";
+const REGION = process.env.E2E_REGION ?? loadConfig().region;
 const athena = new AthenaClient({ region: REGION });
 
 /** 데이터베이스 이름 */

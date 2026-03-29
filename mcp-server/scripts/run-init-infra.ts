@@ -35,7 +35,7 @@ import {
 } from "@aws-sdk/client-firehose";
 import { loadConfig } from "../src/config.js";
 
-const REGION = process.env.E2E_REGION ?? "us-east-1";
+const REGION = process.env.E2E_REGION ?? loadConfig().region;
 const config = loadConfig();
 
 /** 데이터베이스 이름. Glue는 하이픈을 허용하지 않으므로 언더스코어 사용 */

@@ -176,6 +176,8 @@ export interface ConnectionConfig {
  * - 함수 간에 설정을 전달할 때 타입 안전성을 보장합니다.
  */
 export interface AppConfig {
+  /** AWS 리전 (기본값: ap-northeast-2). 사용자가 config.yaml에서 변경 가능. */
+  region: string;
   s3: S3Config;
   firehose: FirehoseConfig;
   schema: SchemaConfig;
@@ -197,6 +199,7 @@ export interface AppConfig {
 
 /** 설정 파일이 없을 때 사용되는 기본 설정 */
 export const DEFAULT_CONFIG: AppConfig = {
+  region: "ap-northeast-2",
   s3: {
     bucket: "s3-logwatch-logs",
     base_prefix: "seungjae/",
@@ -447,6 +450,7 @@ export function validateConfig(config: AppConfig): string[] {
  */
 export function mergeWithDefaults(partial: Partial<AppConfig>): AppConfig {
   return {
+    region: partial.region ?? DEFAULT_CONFIG.region,
     s3: {
       ...DEFAULT_CONFIG.s3,
       ...(partial.s3 ?? {}),

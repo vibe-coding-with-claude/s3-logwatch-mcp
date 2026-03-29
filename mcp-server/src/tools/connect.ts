@@ -109,7 +109,7 @@ const regionSchema = z
   .string()
   .optional()
   .describe(
-    'AWS region (default: "us-east-1"). Example: "ap-northeast-2" for Seoul.'
+    'AWS region (default: config region (ap-northeast-2)). Example: "ap-northeast-2" for Seoul.'
   );
 
 // =============================================================
@@ -230,12 +230,12 @@ async function connectLogGroup(
   filterPattern?: string,
   region?: string
 ): Promise<string> {
-  const resolvedRegion = region ?? "us-east-1";
+  const config = loadConfig();
+  const resolvedRegion = region ?? config.region;
   const resolvedFilterPattern = filterPattern ?? "";
 
   // --- (1) config.yaml에서 Firehose delivery stream 이름 가져오기 ---
   // 왜 config에서 읽나? init-infra에서 생성한 Firehose 이름을 일관되게 사용하기 위해서입니다.
-  const config = loadConfig();
   const deliveryStreamName = config.firehose.delivery_stream;
 
   if (!deliveryStreamName) {

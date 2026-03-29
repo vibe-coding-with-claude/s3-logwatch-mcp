@@ -11,7 +11,7 @@ import {
 } from "@aws-sdk/client-athena";
 import { loadConfig } from "../src/config.js";
 
-const REGION = process.env.E2E_REGION ?? "us-east-1";
+const REGION = process.env.E2E_REGION ?? loadConfig().region;
 const config = loadConfig();
 const athena = new AthenaClient({ region: REGION });
 

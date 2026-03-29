@@ -132,7 +132,7 @@ const regionSchema = z
   .string()
   .optional()
   .describe(
-    'AWS region to create resources in (default: "us-east-1"). Example: "ap-northeast-2" for Seoul.'
+    'AWS region to create resources in (default: config region (ap-northeast-2)). Example: "ap-northeast-2" for Seoul.'
   );
 
 // =============================================================
@@ -304,8 +304,8 @@ export function buildCreateTableDDL(config: ReturnType<typeof loadConfig>): stri
  * @returns 각 리소스별 생성 결과 배열
  */
 async function initInfra(region?: string): Promise<ResourceResult[]> {
-  const resolvedRegion = region ?? "us-east-1";
   const config = loadConfig();
+  const resolvedRegion = region ?? config.region;
   const results: ResourceResult[] = [];
 
   // AWS SDK 클라이언트 생성

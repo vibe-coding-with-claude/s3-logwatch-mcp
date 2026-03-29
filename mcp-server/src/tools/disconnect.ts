@@ -62,7 +62,7 @@ const regionSchema = z
   .string()
   .optional()
   .describe(
-    'AWS region (default: "us-east-1"). Example: "ap-northeast-2" for Seoul.'
+    'AWS region (default: config region (ap-northeast-2)). Example: "ap-northeast-2" for Seoul.'
   );
 
 // =============================================================
@@ -146,7 +146,8 @@ async function disconnectLogGroup(
   domain: string,
   region?: string
 ): Promise<string> {
-  const resolvedRegion = region ?? "us-east-1";
+  const config = loadConfig();
+  const resolvedRegion = region ?? config.region;
 
   // AWS SDK 클라이언트 생성
   const cwlClient = new CloudWatchLogsClient({ region: resolvedRegion });
@@ -180,16 +181,17 @@ async function disconnectLogGroup(
   }
 
   // --- (3) config.yaml의 connections에서 해당 항목 제거 ---
-  const config = loadConfig();
-  const beforeCount = config.connections.length;
-  config.connections = config.connections.filter(
+  // config를 최신 상태로 다시 읽어서 connections 수정
+  const latestConfig = loadConfig();
+  const beforeCount = latestConfig.connections.length;
+  latestConfig.connections = latestConfig.connections.filter(
     (c) => !(c.log_group === logGroup && c.domain === domain)
   );
-  const removedFromConfig = config.connections.length < beforeCount;
+  const removedFromConfig = latestConfig.connections.length < beforeCount;
 
   // 변경이 있으면 config.yaml 저장
   if (removedFromConfig) {
-    saveConfig(config);
+    saveConfig(latestConfig);
   }
 
   // --- (4) 결과 메시지 반환 ---

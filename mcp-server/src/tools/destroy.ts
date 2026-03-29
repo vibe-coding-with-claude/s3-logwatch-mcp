@@ -99,7 +99,7 @@ const regionSchema = z
   .string()
   .optional()
   .describe(
-    'AWS region (default: "us-east-1"). Example: "ap-northeast-2" for Seoul.'
+    'AWS region (default: config region (ap-northeast-2)). Example: "ap-northeast-2" for Seoul.'
   );
 
 const forceDeleteS3Schema = z
@@ -181,8 +181,8 @@ async function destroyInfra(
   region?: string,
   forceDeleteS3: boolean = false
 ): Promise<DestroyResult[]> {
-  const resolvedRegion = region ?? "us-east-1";
   const config = loadConfig();
+  const resolvedRegion = region ?? config.region;
   const results: DestroyResult[] = [];
 
   // AWS SDK 클라이언트 생성

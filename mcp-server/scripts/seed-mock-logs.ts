@@ -22,7 +22,7 @@ import { loadConfig } from "../src/config.js";
 // =============================================================
 // 설정
 // =============================================================
-const REGION = process.env.E2E_REGION ?? "us-east-1";
+const REGION = process.env.E2E_REGION ?? loadConfig().region;
 const config = loadConfig();
 const s3 = new S3Client({ region: REGION });
 

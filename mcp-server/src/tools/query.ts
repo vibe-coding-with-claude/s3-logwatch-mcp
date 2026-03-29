@@ -123,7 +123,7 @@ const regionSchema = z
   .string()
   .optional()
   .describe(
-    'AWS region for Athena. Defaults to "us-east-1". Override if your resources are in a different region.'
+    'AWS region for Athena. Defaults to config region. Override if your resources are in a different region.'
   );
 
 // =============================================================
@@ -261,7 +261,7 @@ async function executeQuery(sql: string, region?: string) {
 
   // 1단계: 설정 로드
   const config = loadConfig();
-  const resolvedRegion = region ?? "us-east-1";
+  const resolvedRegion = region ?? config.region;
 
   // Athena 클라이언트 생성
   // 왜 매번 생성하나? region이 호출마다 다를 수 있으므로 재사용이 어렵습니다.

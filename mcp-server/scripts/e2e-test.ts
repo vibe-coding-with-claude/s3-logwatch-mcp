@@ -42,7 +42,7 @@ import { existsSync } from "node:fs";
 // 설정
 // =============================================================
 
-const REGION = process.env.E2E_REGION ?? "us-east-1";
+const REGION = process.env.E2E_REGION ?? loadConfig().region;
 const TEST_LOG_GROUP = process.env.E2E_LOG_GROUP ?? "/ecs/e2e-test";
 const SKIP_INIT = process.env.E2E_SKIP_INIT === "true";
 const SKIP_CONNECT = process.env.E2E_SKIP_CONNECT === "true";

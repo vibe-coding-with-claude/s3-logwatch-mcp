@@ -32,7 +32,7 @@ const MAX_WAIT_MS = 60000;
 const regionSchema = z
   .string()
   .optional()
-  .describe('AWS region for Athena. Defaults to "us-east-1".');
+  .describe('AWS region for Athena. Defaults to config region.');
 
 // =============================================================
 // 도구 등록
@@ -76,7 +76,7 @@ interface RuleCheckResult {
 
 async function handleCheckAlerts(region?: string) {
   const config = loadConfig();
-  const resolvedRegion = region ?? "us-east-1";
+  const resolvedRegion = region ?? config.region;
 
   if (config.alerts.rules.length === 0) {
     return {
