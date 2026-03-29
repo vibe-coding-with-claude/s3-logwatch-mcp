@@ -201,7 +201,7 @@ export interface AppConfig {
 export const DEFAULT_CONFIG: AppConfig = {
   region: "ap-northeast-2",
   s3: {
-    bucket: "s3-logwatch-logs",
+    bucket: "s3-logwatch-logs-ap2",
     base_prefix: "seungjae/",
     retention_days: 90, // 90일 후 S3 객체 삭제
   },
@@ -229,7 +229,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   },
   athena: {
     workgroup: "s3-logwatch",
-    output_location: "s3://s3-logwatch-logs/athena-results/",
+    output_location: "s3://s3-logwatch-logs-ap2/athena-results/",
   },
   // 도메인별 S3 경로: 각 도메인의 로그가 독립적인 S3 경로에 저장됩니다.
   domains: [
