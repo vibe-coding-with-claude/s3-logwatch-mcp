@@ -18,6 +18,10 @@ import { registerInitTool } from "./init.js";
 import { registerConnectTool } from "./connect.js";
 import { registerQueryTool } from "./query.js";
 import { registerCostTool } from "./cost.js";
+import { registerDestroyTool } from "./destroy.js";
+import { registerDisconnectTool } from "./disconnect.js";
+import { registerAlertTool } from "./alert.js";
+import { registerCheckAlertTool } from "./check-alert.js";
 
 /**
  * 모든 도구를 MCP Server에 등록하는 함수
@@ -42,4 +46,14 @@ export function registerTools(server: McpServer): void {
 
   // T-006: 쿼리 비용 조회 도구
   registerCostTool(server);
+
+  // T-018: AWS 인프라 삭제 도구
+  registerDestroyTool(server);
+
+  // T-019: Log Group 연결 해제 도구
+  registerDisconnectTool(server);
+
+  // T-025: 알림 설정 및 체크 도구
+  registerAlertTool(server);
+  registerCheckAlertTool(server);
 }
