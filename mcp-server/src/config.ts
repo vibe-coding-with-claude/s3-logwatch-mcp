@@ -43,6 +43,8 @@ import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 export interface S3Config {
   bucket: string;
   base_prefix: string;
+  retention_days?: number;        // 로그 보존 일수 (기본 90). 이 일수가 지나면 객체를 삭제합니다.
+  glacier_transition_days?: number; // Glacier 이동 일수 (기본 없음). 설정 시 해당 일수 후 Glacier로 전환합니다.
 }
 
 /**
@@ -69,6 +71,7 @@ export interface FirehoseConfig {
   delivery_stream: string;
   buffer_interval: number;
   buffer_size: number;
+  format: "json" | "parquet";  // 데이터 저장 포맷 (기본값: "json"). parquet 선택 시 DataFormatConversion 활성화.
 }
 
 /**
@@ -120,6 +123,34 @@ export interface AthenaConfig {
 }
 
 /**
+ * 알림 규칙 설정
+ * - name: 알림 이름 (예: "payment-errors")
+ * - domain: 대상 도메인 (예: "payment")
+ * - level: 로그 레벨 필터 (예: "ERROR"). 생략 시 모든 레벨.
+ * - keyword: 메시지 키워드 (예: "timeout"). 생략 시 키워드 필터 없음.
+ * - threshold: 이 건수를 초과하면 알림 발생
+ * - period_minutes: 최근 N분 기준으로 집계
+ */
+export interface AlertRule {
+  name: string;
+  domain: string;
+  level?: string;
+  keyword?: string;
+  threshold: number;
+  period_minutes: number;
+}
+
+/**
+ * 알림 설정
+ * - webhook_url: Slack/Discord webhook URL (선택)
+ * - rules: 알림 규칙 목록
+ */
+export interface AlertConfig {
+  webhook_url?: string;
+  rules: AlertRule[];
+}
+
+/**
  * CloudWatch Log Group 연결 설정
  * - log_group: CloudWatch Log Group 이름 (예: "/ecs/payment-api")
  * - filter_pattern: 구독 필터 패턴 (빈 문자열이면 모든 로그를 수집)
@@ -153,6 +184,8 @@ export interface AppConfig {
   /** 도메인별 S3 경로 목록. 각 도메인은 독립적인 S3 prefix를 가집니다. */
   domains: DomainConfig[];
   connections: ConnectionConfig[];
+  /** 알림 설정: webhook URL과 알림 규칙 목록 */
+  alerts: AlertConfig;
 }
 
 // =============================================================
@@ -167,11 +200,13 @@ export const DEFAULT_CONFIG: AppConfig = {
   s3: {
     bucket: "s3-logwatch-logs",
     base_prefix: "seungjae/",
+    retention_days: 90, // 90일 후 S3 객체 삭제
   },
   firehose: {
     delivery_stream: "s3-logwatch-stream",
     buffer_interval: 300, // 5분 (초 단위)
     buffer_size: 5, // 5MB
+    format: "json", // JSON Lines 포맷으로 저장 (parquet 선택 시 DataFormatConversion 활성화)
   },
   schema: {
     columns: [
@@ -202,6 +237,7 @@ export const DEFAULT_CONFIG: AppConfig = {
     { name: "notification", s3_prefix: "seungjae/notification/" },
   ],
   connections: [],
+  alerts: { rules: [] },
 };
 
 // =============================================================
@@ -311,6 +347,20 @@ export function validateConfig(config: AppConfig): string[] {
     errors.push("s3.base_prefix는 필수 항목입니다.");
   }
 
+  // S3 retention 검증: 설정된 경우 양수여야 합니다
+  if (
+    config.s3?.retention_days != null &&
+    (typeof config.s3.retention_days !== "number" || config.s3.retention_days <= 0)
+  ) {
+    errors.push("s3.retention_days는 0보다 큰 숫자여야 합니다.");
+  }
+  if (
+    config.s3?.glacier_transition_days != null &&
+    (typeof config.s3.glacier_transition_days !== "number" || config.s3.glacier_transition_days <= 0)
+  ) {
+    errors.push("s3.glacier_transition_days는 0보다 큰 숫자여야 합니다.");
+  }
+
   // Firehose 설정 검증
   if (!config.firehose?.delivery_stream) {
     errors.push("firehose.delivery_stream은 필수 항목입니다.");
@@ -326,6 +376,15 @@ export function validateConfig(config: AppConfig): string[] {
     config.firehose.buffer_size <= 0
   ) {
     errors.push("firehose.buffer_size는 0보다 큰 숫자여야 합니다.");
+  }
+
+  // Firehose format 검증: "json" 또는 "parquet"만 허용합니다
+  if (
+    config.firehose?.format != null &&
+    config.firehose.format !== "json" &&
+    config.firehose.format !== "parquet"
+  ) {
+    errors.push('firehose.format은 "json" 또는 "parquet"이어야 합니다.');
   }
 
   // 스키마 검증
@@ -386,7 +445,7 @@ export function validateConfig(config: AppConfig): string[] {
  * - 설정 구조가 2단계(s3.bucket 등)로 단순해서 얕은 병합으로 충분합니다.
  * - 깊은 병합은 라이브러리 의존성이 추가되고, 배열 병합 규칙이 복잡해집니다.
  */
-function mergeWithDefaults(partial: Partial<AppConfig>): AppConfig {
+export function mergeWithDefaults(partial: Partial<AppConfig>): AppConfig {
   return {
     s3: {
       ...DEFAULT_CONFIG.s3,
@@ -421,6 +480,13 @@ function mergeWithDefaults(partial: Partial<AppConfig>): AppConfig {
         ? partial.domains
         : DEFAULT_CONFIG.domains,
     connections: partial.connections ?? DEFAULT_CONFIG.connections,
+    alerts: {
+      webhook_url: partial.alerts?.webhook_url ?? DEFAULT_CONFIG.alerts.webhook_url,
+      rules:
+        partial.alerts?.rules && partial.alerts.rules.length > 0
+          ? partial.alerts.rules
+          : DEFAULT_CONFIG.alerts.rules,
+    },
   };
 }
 

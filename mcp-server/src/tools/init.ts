@@ -38,7 +38,9 @@ import {
   S3Client,
   CreateBucketCommand,
   HeadBucketCommand,
+  PutBucketLifecycleConfigurationCommand,
   type CreateBucketCommandInput,
+  type LifecycleRule,
 } from "@aws-sdk/client-s3";
 
 import {
@@ -53,6 +55,16 @@ import {
   CreateDeliveryStreamCommand,
   DescribeDeliveryStreamCommand,
 } from "@aws-sdk/client-firehose";
+
+// Lambda SDK: Lambda 변환 함수 생성에 사용합니다.
+// CloudWatch Logs -> Firehose로 전달되는 gzip 데이터를 해제하고
+// logEvents를 개별 레코드로 분리하는 Lambda 함수를 생성합니다.
+import {
+  LambdaClient,
+  CreateFunctionCommand,
+  GetFunctionCommand,
+  type Runtime,
+} from "@aws-sdk/client-lambda";
 
 import {
   AthenaClient,
@@ -95,6 +107,12 @@ const TABLE_NAME = "logs";
 
 /** Firehose용 IAM 역할 이름 */
 const FIREHOSE_ROLE_NAME = "s3-logwatch-firehose-role";
+
+/** Lambda 변환 함수 이름 */
+const LAMBDA_FUNCTION_NAME = "s3-logwatch-transformer";
+
+/** Lambda용 IAM 역할 이름 */
+const LAMBDA_ROLE_NAME = "s3-logwatch-lambda-role";
 
 // =============================================================
 // 입력 파라미터 스키마
@@ -222,6 +240,20 @@ export function buildCreateTableDDL(config: ReturnType<typeof loadConfig>): stri
   // config.domains에서 도메인 이름 목록을 추출하여 쉼표로 연결
   const domainValues = config.domains.map(d => d.name).join(",");
 
+  // format에 따라 SerDe를 결정합니다
+  // - json: JsonSerDe (JSON Lines 포맷)
+  // - parquet: ParquetHiveSerDe (Parquet 컬럼형 포맷)
+  const isParquet = config.firehose.format === "parquet";
+  const serdeLine = isParquet
+    ? "ROW FORMAT SERDE 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'"
+    : "ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'";
+  const serdeProps = isParquet
+    ? ""
+    : "\n    WITH SERDEPROPERTIES ('case.insensitive' = 'true')";
+  const storedAs = isParquet
+    ? "\n    STORED AS PARQUET"
+    : "";
+
   return `
     CREATE EXTERNAL TABLE IF NOT EXISTS ${DATABASE_NAME}.${TABLE_NAME} (
       timestamp string,
@@ -231,8 +263,7 @@ export function buildCreateTableDDL(config: ReturnType<typeof loadConfig>): stri
       trace_id string
     )
     PARTITIONED BY (domain string, year string, month string, day string)
-    ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
-    WITH SERDEPROPERTIES ('case.insensitive' = 'true')
+    ${serdeLine}${serdeProps}${storedAs}
     LOCATION 's3://${config.s3.bucket}/${config.s3.base_prefix}'
     TBLPROPERTIES (
       'projection.enabled' = 'true',
@@ -284,6 +315,10 @@ async function initInfra(region?: string): Promise<ResourceResult[]> {
   // --- (a) S3 버킷 생성 ---
   results.push(await createS3Bucket(s3, config.s3.bucket, resolvedRegion));
 
+  // --- (a-2) S3 Lifecycle Rule 설정 ---
+  // retention_days, glacier_transition_days 설정에 따라 객체 수명 주기를 관리합니다.
+  results.push(await createS3Lifecycle(s3, config));
+
   // --- (b) Athena 워크그룹 생성 (DDL 실행 전에 워크그룹이 필요) ---
   results.push(
     await createAthenaWorkgroup(athena, config)
@@ -302,11 +337,34 @@ async function initInfra(region?: string): Promise<ResourceResult[]> {
     await createFirehoseIamRole(iam, config.s3.bucket, resolvedRegion, accountId)
   );
 
+  // --- (d-2) Lambda용 IAM 역할 생성 ---
+  // Lambda 변환 함수가 CloudWatch Logs를 쓰기 위한 역할입니다.
+  const lambda = new LambdaClient({ region: resolvedRegion });
+  results.push(
+    await createLambdaIamRole(iam, resolvedRegion)
+  );
+
+  // --- (d-3) Lambda 변환 함수 생성 ---
+  // CloudWatch Logs의 gzip 데이터를 해제하고 logEvents를 분리합니다.
+  results.push(
+    await createLambdaFunction(lambda, iam, config, resolvedRegion)
+  );
+
   // --- (e) Firehose delivery stream 생성 ---
   // IAM 역할 생성 직후에는 AWS 내부 전파 지연이 있을 수 있습니다.
   // 실패하면 "잠시 후 다시 시도하세요" 안내를 포함합니다.
+  // Lambda 함수 ARN을 조회하여 Firehose ProcessingConfiguration에 연결합니다.
+  let lambdaArn: string | undefined;
+  try {
+    const lambdaInfo = await lambda.send(
+      new GetFunctionCommand({ FunctionName: LAMBDA_FUNCTION_NAME })
+    );
+    lambdaArn = lambdaInfo.Configuration?.FunctionArn;
+  } catch {
+    // Lambda 함수가 없을 수 있음 (생성 실패 등) - Firehose는 Lambda 없이도 생성 가능
+  }
   results.push(
-    await createFirehoseStream(firehose, config, resolvedRegion, accountId)
+    await createFirehoseStream(firehose, config, resolvedRegion, accountId, lambdaArn)
   );
 
   return results;
@@ -385,6 +443,101 @@ async function createS3Bucket(
     const message = error instanceof Error ? error.message : String(error);
     return {
       name: "S3 Bucket",
+      status: "failed",
+      detail: `s3://${bucketName} - ${message}`,
+    };
+  }
+}
+
+// =============================================================
+// (a-2) S3 Lifecycle Rule 설정
+// =============================================================
+
+/**
+ * S3 버킷에 Lifecycle Rule을 설정합니다.
+ *
+ * Lifecycle Rule이란?
+ * - S3 객체의 수명 주기를 자동으로 관리합니다.
+ * - retention_days 후 객체를 삭제합니다.
+ * - glacier_transition_days가 설정되면 해당 일수 후 Glacier 스토리지 클래스로 전환합니다.
+ *   (Glacier는 저비용 장기 보관용 스토리지입니다)
+ *
+ * 멱등성:
+ * - PutBucketLifecycleConfiguration은 기존 설정을 덮어씁니다.
+ * - retention_days가 설정되지 않으면 Lifecycle Rule을 생성하지 않습니다.
+ */
+async function createS3Lifecycle(
+  s3: S3Client,
+  config: ReturnType<typeof loadConfig>
+): Promise<ResourceResult> {
+  const bucketName = config.s3.bucket;
+  const retentionDays = config.s3.retention_days;
+  const glacierDays = config.s3.glacier_transition_days;
+
+  // retention_days가 설정되지 않으면 Lifecycle Rule을 생성하지 않습니다
+  if (retentionDays == null) {
+    return {
+      name: "S3 Lifecycle",
+      status: "exists",
+      detail: `s3://${bucketName} - retention_days 미설정, Lifecycle Rule 스킵`,
+    };
+  }
+
+  try {
+    const rules: LifecycleRule[] = [];
+
+    // Glacier 전환 규칙: glacier_transition_days가 설정된 경우에만 추가
+    if (glacierDays != null) {
+      rules.push({
+        ID: "s3-logwatch-glacier-transition",
+        Status: "Enabled",
+        Filter: {
+          Prefix: config.s3.base_prefix,
+        },
+        Transitions: [
+          {
+            Days: glacierDays,
+            StorageClass: "GLACIER",
+          },
+        ],
+      });
+    }
+
+    // 만료(삭제) 규칙: retention_days 후 객체 삭제
+    rules.push({
+      ID: "s3-logwatch-expiration",
+      Status: "Enabled",
+      Filter: {
+        Prefix: config.s3.base_prefix,
+      },
+      Expiration: {
+        Days: retentionDays,
+      },
+    });
+
+    await s3.send(
+      new PutBucketLifecycleConfigurationCommand({
+        Bucket: bucketName,
+        LifecycleConfiguration: {
+          Rules: rules,
+        },
+      })
+    );
+
+    const details: string[] = [`${retentionDays}일 후 삭제`];
+    if (glacierDays != null) {
+      details.unshift(`${glacierDays}일 후 Glacier 전환`);
+    }
+
+    return {
+      name: "S3 Lifecycle",
+      status: "created",
+      detail: `s3://${bucketName} (${details.join(", ")})`,
+    };
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      name: "S3 Lifecycle",
       status: "failed",
       detail: `s3://${bucketName} - ${message}`,
     };
@@ -683,6 +836,203 @@ async function createFirehoseIamRole(
 }
 
 // =============================================================
+// (d-2) Lambda용 IAM 역할 생성
+// =============================================================
+
+/**
+ * Lambda 변환 함수용 IAM 역할을 생성합니다.
+ *
+ * Trust Policy: lambda.amazonaws.com만 이 역할을 assume할 수 있습니다.
+ * 권한: CloudWatch Logs 쓰기 (Lambda 실행 로그)
+ */
+async function createLambdaIamRole(
+  iam: IAMClient,
+  _region: string
+): Promise<ResourceResult> {
+  try {
+    await iam.send(new GetRoleCommand({ RoleName: LAMBDA_ROLE_NAME }));
+    return {
+      name: "Lambda IAM Role",
+      status: "exists",
+      detail: `${LAMBDA_ROLE_NAME} (이미 존재)`,
+    };
+  } catch (error: unknown) {
+    const errorName = (error as { name?: string })?.name ?? "";
+    if (errorName !== "NoSuchEntityException") {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        name: "Lambda IAM Role",
+        status: "failed",
+        detail: `${LAMBDA_ROLE_NAME} - ${message}`,
+      };
+    }
+  }
+
+  try {
+    const trustPolicy = {
+      Version: "2012-10-17",
+      Statement: [
+        {
+          Effect: "Allow",
+          Principal: { Service: "lambda.amazonaws.com" },
+          Action: "sts:AssumeRole",
+        },
+      ],
+    };
+
+    await iam.send(
+      new CreateRoleCommand({
+        RoleName: LAMBDA_ROLE_NAME,
+        AssumeRolePolicyDocument: JSON.stringify(trustPolicy),
+        Description:
+          "s3-logwatch: Lambda 변환 함수가 CloudWatch Logs에 실행 로그를 쓰기 위한 역할",
+      })
+    );
+
+    const inlinePolicy = {
+      Version: "2012-10-17",
+      Statement: [
+        {
+          Sid: "CloudWatchLogsAccess",
+          Effect: "Allow",
+          Action: [
+            "logs:CreateLogGroup",
+            "logs:CreateLogStream",
+            "logs:PutLogEvents",
+          ],
+          Resource: "arn:aws:logs:*:*:*",
+        },
+      ],
+    };
+
+    await iam.send(
+      new PutRolePolicyCommand({
+        RoleName: LAMBDA_ROLE_NAME,
+        PolicyName: "s3-logwatch-lambda-policy",
+        PolicyDocument: JSON.stringify(inlinePolicy),
+      })
+    );
+
+    return {
+      name: "Lambda IAM Role",
+      status: "created",
+      detail: `${LAMBDA_ROLE_NAME} (CloudWatch Logs 쓰기 권한)`,
+    };
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      name: "Lambda IAM Role",
+      status: "failed",
+      detail: `${LAMBDA_ROLE_NAME} - ${message}`,
+    };
+  }
+}
+
+// =============================================================
+// (d-3) Lambda 변환 함수 생성
+// =============================================================
+
+/**
+ * Firehose 데이터 변환용 Lambda 함수를 생성합니다.
+ *
+ * CloudWatch Logs에서 전달된 gzip 데이터를 해제하고,
+ * logEvents 배열을 개별 레코드로 분리하며,
+ * logGroup -> domain 매핑을 적용합니다.
+ *
+ * 환경변수 DOMAIN_MAPPING:
+ * - config.connections에서 logGroup -> domain 매핑을 생성합니다.
+ * - 예: {"/ecs/payment-api":"payment","/ecs/user-api":"user"}
+ */
+async function createLambdaFunction(
+  lambda: LambdaClient,
+  iam: IAMClient,
+  config: ReturnType<typeof loadConfig>,
+  _region: string
+): Promise<ResourceResult> {
+  try {
+    await lambda.send(
+      new GetFunctionCommand({ FunctionName: LAMBDA_FUNCTION_NAME })
+    );
+    return {
+      name: "Lambda Function",
+      status: "exists",
+      detail: `${LAMBDA_FUNCTION_NAME} (이미 존재)`,
+    };
+  } catch (error: unknown) {
+    const errorName = (error as { name?: string })?.name ?? "";
+    if (errorName !== "ResourceNotFoundException") {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        name: "Lambda Function",
+        status: "failed",
+        detail: `${LAMBDA_FUNCTION_NAME} - ${message}`,
+      };
+    }
+  }
+
+  try {
+    // Lambda IAM 역할 ARN 조회
+    const roleResponse = await iam.send(
+      new GetRoleCommand({ RoleName: LAMBDA_ROLE_NAME })
+    );
+    const roleArn = roleResponse.Role?.Arn;
+
+    if (!roleArn) {
+      return {
+        name: "Lambda Function",
+        status: "failed",
+        detail: `${LAMBDA_FUNCTION_NAME} - Lambda IAM 역할 ARN을 가져올 수 없습니다.`,
+      };
+    }
+
+    // config.connections에서 logGroup -> domain 매핑 생성
+    const domainMapping: Record<string, string> = {};
+    for (const conn of config.connections) {
+      domainMapping[conn.log_group] = conn.domain;
+    }
+
+    // 플레이스홀더 코드 (실제 변환 로직은 src/lambda/transformer.ts에 있음)
+    const placeholderCode = Buffer.from(
+      'exports.handler = async (event) => { return { records: event.records.map(r => ({ recordId: r.recordId, result: "Ok", data: r.data })) }; };'
+    );
+
+    const runtime: Runtime = "nodejs20.x" as Runtime;
+
+    await lambda.send(
+      new CreateFunctionCommand({
+        FunctionName: LAMBDA_FUNCTION_NAME,
+        Runtime: runtime,
+        Role: roleArn,
+        Handler: "index.handler",
+        Code: { ZipFile: placeholderCode },
+        Description:
+          "s3-logwatch: CloudWatch Logs gzip 해제 + logEvents 분리 + domain 매핑",
+        Timeout: 60,
+        MemorySize: 128,
+        Environment: {
+          Variables: {
+            DOMAIN_MAPPING: JSON.stringify(domainMapping),
+          },
+        },
+      })
+    );
+
+    return {
+      name: "Lambda Function",
+      status: "created",
+      detail: `${LAMBDA_FUNCTION_NAME} (domain 매핑: ${Object.keys(domainMapping).length}개 로그 그룹)`,
+    };
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      name: "Lambda Function",
+      status: "failed",
+      detail: `${LAMBDA_FUNCTION_NAME} - ${message}`,
+    };
+  }
+}
+
+// =============================================================
 // (e) Firehose Delivery Stream 생성
 // =============================================================
 
@@ -703,7 +1053,8 @@ async function createFirehoseStream(
   firehose: FirehoseClient,
   config: ReturnType<typeof loadConfig>,
   region: string,
-  _accountId: string
+  _accountId: string,
+  lambdaArn?: string
 ): Promise<ResourceResult> {
   const streamName = config.firehose.delivery_stream;
 
@@ -749,6 +1100,7 @@ async function createFirehoseStream(
     }
 
     const bucketArn = `arn:aws:s3:::${config.s3.bucket}`;
+    const isParquet = config.firehose.format === "parquet";
 
     // 동적 파티셔닝 Prefix 설명:
     // !{partitionKeyFromQuery:domain}: JQ로 추출한 domain 필드값 (예: "user", "order")
@@ -761,6 +1113,33 @@ async function createFirehoseStream(
       `!{timestamp:yyyy}/` +
       `!{timestamp:MM}/` +
       `!{timestamp:dd}/`;
+
+    // Parquet DataFormatConversion 설정
+    // Firehose가 JSON 입력을 Parquet로 변환하여 S3에 저장합니다.
+    // Glue Data Catalog의 테이블 스키마를 참조하여 컬럼 타입을 결정합니다.
+    const dataFormatConversion = isParquet
+      ? {
+          Enabled: true,
+          SchemaConfiguration: {
+            RoleARN: roleArn,
+            DatabaseName: DATABASE_NAME,
+            TableName: TABLE_NAME,
+            Region: region,
+          },
+          InputFormatConfiguration: {
+            Deserializer: {
+              OpenXJsonSerDe: {},
+            },
+          },
+          OutputFormatConfiguration: {
+            Serializer: {
+              ParquetSerDe: {
+                Compression: "SNAPPY" as const,
+              },
+            },
+          },
+        }
+      : undefined;
 
     await firehose.send(
       new CreateDeliveryStreamCommand({
@@ -781,17 +1160,40 @@ async function createFirehoseStream(
             // Dynamic Partitioning 사용 시 최소 64MB 필요
             SizeInMBs: Math.max(config.firehose.buffer_size, 64),
           },
-          // 압축: JSON 원본을 그대로 저장하므로 UNCOMPRESSED
+          // 압축: JSON은 UNCOMPRESSED, Parquet은 DataFormatConversion이 Snappy 압축을 처리
           CompressionFormat: "UNCOMPRESSED",
           // 동적 파티셔닝: 로그 필드값을 기반으로 S3 경로를 결정합니다
           DynamicPartitioningConfiguration: {
             Enabled: true,
           },
-          // 파티션 키 추출을 위한 JQ 프로세서 + 줄바꿈 구분자 추가
-          // CloudWatch에서 온 JSON 로그에서 domain 필드를 추출합니다
+          // Parquet 포맷인 경우 DataFormatConversion 활성화
+          ...(dataFormatConversion
+            ? { DataFormatConversionConfiguration: dataFormatConversion }
+            : {}),
+          // 프로세서 목록: Lambda 변환 + JQ 메타데이터 추출 + 줄바꿈 구분자
+          // Lambda: CloudWatch gzip 해제 + logEvents 분리 + domain 매핑
+          // JQ: 변환된 JSON에서 domain 필드를 추출하여 동적 파티셔닝에 사용
           ProcessingConfiguration: {
             Enabled: true,
             Processors: [
+              // Lambda 변환 프로세서 (ARN이 있을 때만 추가)
+              ...(lambdaArn
+                ? [
+                    {
+                      Type: "Lambda" as const,
+                      Parameters: [
+                        {
+                          ParameterName: "LambdaArn" as const,
+                          ParameterValue: lambdaArn,
+                        },
+                        {
+                          ParameterName: "RoleArn" as const,
+                          ParameterValue: roleArn!,
+                        },
+                      ],
+                    },
+                  ]
+                : []),
               {
                 // JQ를 사용하여 JSON 레코드에서 domain 필드를 추출합니다.
                 // 추출된 값은 동적 파티셔닝의 !{partitionKeyFromQuery:domain}에 매핑됩니다.
@@ -809,9 +1211,7 @@ async function createFirehoseStream(
               },
               {
                 // 각 레코드 끝에 줄바꿈(\n)을 추가합니다.
-                // 왜 필요한가? Firehose는 기본적으로 레코드를 구분자 없이 연결합니다.
-                // JSON Lines 포맷(한 줄에 하나의 JSON)을 유지하려면 줄바꿈이 필요합니다.
-                // Athena의 JSON SerDe가 각 줄을 독립적인 JSON으로 파싱합니다.
+                // JSON Lines 포맷을 유지하기 위해 필요합니다.
                 Type: "AppendDelimiterToRecord",
                 Parameters: [
                   {
@@ -826,10 +1226,11 @@ async function createFirehoseStream(
       })
     );
 
+    const formatLabel = isParquet ? "Parquet" : "JSON";
     return {
       name: "Firehose Stream",
       status: "created",
-      detail: `${streamName} (JSON 포맷 + 동적 파티셔닝 활성화)`,
+      detail: `${streamName} (${formatLabel} 포맷 + 동적 파티셔닝 활성화)`,
     };
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
