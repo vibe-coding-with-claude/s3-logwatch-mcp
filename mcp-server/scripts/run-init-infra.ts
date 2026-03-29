@@ -33,17 +33,25 @@ import {
   CreateDeliveryStreamCommand,
   DescribeDeliveryStreamCommand,
 } from "@aws-sdk/client-firehose";
+import {
+  LambdaClient,
+  CreateFunctionCommand,
+  GetFunctionCommand,
+} from "@aws-sdk/client-lambda";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { execSync } from "node:child_process";
 import { loadConfig } from "../src/config.js";
 
 const REGION = process.env.E2E_REGION ?? loadConfig().region;
 const config = loadConfig();
 
-/** 데이터베이스 이름. Glue는 하이픈을 허용하지 않으므로 언더스코어 사용 */
 const DATABASE_NAME = "s3_logwatch";
-/** 테이블 이름 */
 const TABLE_NAME = "logs";
-/** Firehose용 IAM 역할 이름 */
 const FIREHOSE_ROLE_NAME = "s3-logwatch-firehose-role";
+const LAMBDA_ROLE_NAME = "s3-logwatch-lambda-role";
+const LAMBDA_FUNCTION_NAME = "s3-logwatch-transformer";
 
 /**
  * 지정된 밀리초만큼 대기합니다.
@@ -369,6 +377,105 @@ async function main() {
     if (finalDesc.DeliveryStreamDescription?.DeliveryStreamStatus !== "ACTIVE") {
       console.warn(`[warn] Firehose 스트림이 60초 내에 ACTIVE가 되지 않았습니다. 수동 확인이 필요합니다.`);
     }
+  }
+
+  // -------------------------------------------------------
+  // 6. Lambda IAM 역할
+  // -------------------------------------------------------
+  let lambdaRoleArn: string | undefined;
+
+  try {
+    const resp = await iam.send(new GetRoleCommand({ RoleName: LAMBDA_ROLE_NAME }));
+    lambdaRoleArn = resp.Role?.Arn;
+    console.log(`[exists] Lambda IAM 역할 이미 존재: ${LAMBDA_ROLE_NAME}`);
+  } catch (error: unknown) {
+    const errorName = (error as { name?: string })?.name ?? "";
+    if (errorName !== "NoSuchEntityException") throw error;
+
+    const trustPolicy = {
+      Version: "2012-10-17",
+      Statement: [{
+        Effect: "Allow",
+        Principal: { Service: "lambda.amazonaws.com" },
+        Action: "sts:AssumeRole",
+      }],
+    };
+
+    const createResp = await iam.send(new CreateRoleCommand({
+      RoleName: LAMBDA_ROLE_NAME,
+      AssumeRolePolicyDocument: JSON.stringify(trustPolicy),
+      Description: "s3-logwatch: Lambda role for CloudWatch Logs write",
+    }));
+    lambdaRoleArn = createResp.Role?.Arn;
+
+    await iam.send(new PutRolePolicyCommand({
+      RoleName: LAMBDA_ROLE_NAME,
+      PolicyName: "s3-logwatch-lambda-policy",
+      PolicyDocument: JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [{
+          Effect: "Allow",
+          Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+          Resource: `arn:aws:logs:${REGION}:*:*`,
+        }],
+      }),
+    }));
+
+    console.log(`[created] Lambda IAM 역할 생성: ${LAMBDA_ROLE_NAME}`);
+    // IAM 전파 대기
+    await sleep(10000);
+  }
+
+  // -------------------------------------------------------
+  // 7. Lambda 함수 (Python 3.12)
+  // -------------------------------------------------------
+  const lambdaClient = new LambdaClient({ region: REGION });
+  let lambdaArn: string | undefined;
+
+  try {
+    const resp = await lambdaClient.send(new GetFunctionCommand({ FunctionName: LAMBDA_FUNCTION_NAME }));
+    lambdaArn = resp.Configuration?.FunctionArn;
+    console.log(`[exists] Lambda 함수 이미 존재: ${LAMBDA_FUNCTION_NAME}`);
+  } catch (error: unknown) {
+    const errorName = (error as { name?: string })?.name ?? "";
+    if (errorName !== "ResourceNotFoundException") throw error;
+
+    // Python 코드를 zip으로 패키징
+    const currentDir = dirname(fileURLToPath(import.meta.url));
+    const lambdaSourcePath = join(currentDir, "..", "src", "lambda", "transformer.py");
+    const pythonCode = readFileSync(lambdaSourcePath, "utf-8");
+
+    const tmpDir = join(currentDir, "..", ".lambda-build");
+    execSync(`mkdir -p ${tmpDir}`);
+    writeFileSync(join(tmpDir, "lambda_function.py"), pythonCode, "utf-8");
+    execSync(`cd ${tmpDir} && rm -f lambda.zip && zip lambda.zip lambda_function.py`);
+    const zipBuffer = readFileSync(join(tmpDir, "lambda.zip"));
+    execSync(`rm -rf ${tmpDir}`);
+
+    // domain 매핑: config.connections에서 생성
+    const domainMapping: Record<string, string> = {};
+    for (const conn of config.connections) {
+      domainMapping[conn.log_group] = conn.domain;
+    }
+
+    const createResp = await lambdaClient.send(new CreateFunctionCommand({
+      FunctionName: LAMBDA_FUNCTION_NAME,
+      Runtime: "python3.12",
+      Role: lambdaRoleArn,
+      Handler: "lambda_function.handler",
+      Code: { ZipFile: zipBuffer },
+      Description: "s3-logwatch: CloudWatch Logs gzip decode + domain mapping",
+      Timeout: 60,
+      MemorySize: 128,
+      Environment: {
+        Variables: {
+          DOMAIN_MAPPING: JSON.stringify(domainMapping),
+        },
+      },
+    }));
+    lambdaArn = createResp.FunctionArn;
+
+    console.log(`[created] Lambda 함수 생성: ${LAMBDA_FUNCTION_NAME} (Python 3.12)`);
   }
 
   console.log("\n=== init-infra 완료 ===\n");
