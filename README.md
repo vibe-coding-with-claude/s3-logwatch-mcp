@@ -41,6 +41,7 @@
 - Node.js 20+
 - AWS CLI 설정 완료 (`aws configure`)
 - 필요 AWS 권한: S3, IAM, Firehose, Lambda, Athena, CloudWatch Logs
+- 기본 리전: ap-northeast-2 (서울) — `~/.s3-logwatch/config.yaml`에서 변경 가능
 
 ### 설치
 
@@ -122,7 +123,7 @@ firehose:
 
 athena:
   workgroup: s3-logwatch
-  output_location: s3://s3-logwatch-logs/athena-results/
+  output_location: s3://s3-logwatch-logs-ap2/athena-results/
 
 domains:
   - name: user
@@ -199,7 +200,7 @@ CREATE EXTERNAL TABLE IF NOT EXISTS s3_logwatch.logs (
 )
 PARTITIONED BY (domain string, year string, month string, day string)
 ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
-LOCATION 's3://s3-logwatch-logs/seungjae/'
+LOCATION 's3://s3-logwatch-logs-ap2/seungjae/'
 TBLPROPERTIES (
   'projection.enabled'        = 'true',
   'projection.domain.type'    = 'enum',
@@ -324,6 +325,7 @@ MIT
 - Node.js 20+
 - AWS CLI configured (`aws configure`)
 - Required permissions: S3, IAM, Firehose, Lambda, Athena, CloudWatch Logs
+- Default region: ap-northeast-2 (Seoul) — configurable in `~/.s3-logwatch/config.yaml`
 
 ### Installation
 
@@ -405,7 +407,7 @@ firehose:
 
 athena:
   workgroup: s3-logwatch
-  output_location: s3://s3-logwatch-logs/athena-results/
+  output_location: s3://s3-logwatch-logs-ap2/athena-results/
 
 domains:
   - name: user
@@ -480,7 +482,7 @@ CREATE EXTERNAL TABLE IF NOT EXISTS s3_logwatch.logs (
 )
 PARTITIONED BY (domain string, year string, month string, day string)
 ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
-LOCATION 's3://s3-logwatch-logs/seungjae/'
+LOCATION 's3://s3-logwatch-logs-ap2/seungjae/'
 TBLPROPERTIES (
   'projection.enabled'        = 'true',
   'projection.domain.type'    = 'enum',
