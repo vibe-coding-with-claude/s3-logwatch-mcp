@@ -19,52 +19,19 @@
 
 **앱 로그 포맷 제약 없음** — Spring Boot 텍스트, Node.js JSON, 아무 형식이나 그대로 수집.
 
-## 왜 S3 + Athena인가?
+## MCP 도구 목록
 
-| 기존 방식 | s3-logwatch |
-|---|---|
-| CloudWatch Logs Insights: **$0.005/GB 스캔** | Athena: **$5/TB 스캔** (1,000배 저렴) |
-| 30일 보존 후 삭제 또는 비싼 장기 보관 | S3: **$0.023/GB/월** 무제한 보관 |
-| 별도 대시보드 필요 | **터미널에서 자연어로 바로 분석** |
-| 서비스마다 로그 포맷 파편화 | 도메인별 경로 파티셔닝으로 **통합 쿼리** |
-| 사용 안 해도 기본 비용 발생 | **사용 안 하면 $0** |
-
-### 월 비용 (하루 1GB 로그, 무료 티어 제외)
-
-| 항목 | 비용 |
-|---|---|
-| S3 저장 + 요청 | ~$0.72 |
-| Firehose (동적 파티셔닝 포함) | ~$3.87 |
-| Lambda | ~$0.002 |
-| Athena (하루 10회 쿼리) | ~$0.15 |
-| **합계** | **~$4.7/월** |
-
-## 아키텍처
-
-```
-사용자 (터미널)
-  │  자연어로 질문
-  v
-Claude Code
-  │  MCP 도구 자동 선택 + 호출
-  v
-s3-logwatch MCP Server (TypeScript)
-  │
-  v
-┌──────────────────────────────────────────────────┐
-│  CloudWatch Logs (/ecs/payment-api)              │
-│    → Subscription Filter                         │
-│      → Kinesis Data Firehose                     │
-│        → Lambda (Python) ← gzip 해제 + domain 매핑│
-│          → S3 (도메인별 경로 파티셔닝)              │
-│            → Athena (Partition Projection)        │
-└──────────────────────────────────────────────────┘
-
-S3 경로:
-  seungjae/payment/2026/03/28/
-  seungjae/user/2026/03/29/
-  seungjae/order/2026/03/28/
-```
+| 도구 | 설명 | 자연어 예시 |
+|---|---|---|
+| `init-infra` | AWS 리소스 일괄 생성 (S3, Athena, Lambda, Firehose, IAM) | "인프라 초기화해줘" |
+| `connect-log-group` | CloudWatch Log Group → Firehose 연결 | "payment-api 연결해줘, 도메인은 payment" |
+| `disconnect-log-group` | Log Group 연결 해제 | "payment-api 연결 해제해줘" |
+| `destroy-infra` | AWS 리소스 전체 삭제 | "인프라 삭제해줘" |
+| `athena-query` | Athena SQL 실행 + 결과 + 비용 (5분 캐싱) | "payment 에러 보여줘" |
+| `get-cost` | 세션 내 누적 쿼리 비용 | "쿼리 비용 얼마야?" |
+| `update-config` | 설정 조회/수정 (도메인 추가 시 Athena 자동 갱신) | "billing 도메인 추가해줘" |
+| `set-alert` | 알림 규칙 추가/삭제/조회 | "ERROR 50건 넘으면 Slack 알림" |
+| `check-alerts` | 알림 규칙 체크 + threshold 초과 감지 | "알림 확인해줘" |
 
 ## 빠른 시작
 
@@ -137,20 +104,6 @@ S3, Athena DB/테이블, Lambda, Firehose, IAM 역할이 자동 생성됩니다.
 > "인프라 전부 삭제해줘"
 ```
 
-## MCP 도구 목록
-
-| 도구 | 설명 | 자연어 예시 |
-|---|---|---|
-| `init-infra` | AWS 리소스 일괄 생성 (S3, Athena, Lambda, Firehose, IAM) | "인프라 초기화해줘" |
-| `connect-log-group` | CloudWatch Log Group → Firehose 연결 | "payment-api 연결해줘, 도메인은 payment" |
-| `disconnect-log-group` | Log Group 연결 해제 | "payment-api 연결 해제해줘" |
-| `destroy-infra` | AWS 리소스 전체 삭제 | "인프라 삭제해줘" |
-| `athena-query` | Athena SQL 실행 + 결과 + 비용 (5분 캐싱) | "payment 에러 보여줘" |
-| `get-cost` | 세션 내 누적 쿼리 비용 | "쿼리 비용 얼마야?" |
-| `update-config` | 설정 조회/수정 (도메인 추가 시 Athena 자동 갱신) | "billing 도메인 추가해줘" |
-| `set-alert` | 알림 규칙 추가/삭제/조회 | "ERROR 50건 넘으면 Slack 알림" |
-| `check-alerts` | 알림 규칙 체크 + threshold 초과 감지 | "알림 확인해줘" |
-
 ## 설정
 
 `~/.s3-logwatch/config.yaml`:
@@ -186,6 +139,53 @@ domains:
 alerts:
   webhook_url: https://hooks.slack.com/services/...
   rules: []
+```
+
+## 왜 S3 + Athena인가?
+
+| 기존 방식 | s3-logwatch |
+|---|---|
+| CloudWatch Logs Insights: **$0.005/GB 스캔** | Athena: **$5/TB 스캔** (1,000배 저렴) |
+| 30일 보존 후 삭제 또는 비싼 장기 보관 | S3: **$0.023/GB/월** 무제한 보관 |
+| 별도 대시보드 필요 | **터미널에서 자연어로 바로 분석** |
+| 서비스마다 로그 포맷 파편화 | 도메인별 경로 파티셔닝으로 **통합 쿼리** |
+| 사용 안 해도 기본 비용 발생 | **사용 안 하면 $0** |
+
+### 월 비용 (하루 1GB 로그, 무료 티어 제외)
+
+| 항목 | 비용 |
+|---|---|
+| S3 저장 + 요청 | ~$0.72 |
+| Firehose (동적 파티셔닝 포함) | ~$3.87 |
+| Lambda | ~$0.002 |
+| Athena (하루 10회 쿼리) | ~$0.15 |
+| **합계** | **~$4.7/월** |
+
+## 아키텍처
+
+```
+사용자 (터미널)
+  │  자연어로 질문
+  v
+Claude Code
+  │  MCP 도구 자동 선택 + 호출
+  v
+s3-logwatch MCP Server (TypeScript)
+  │
+  v
+┌──────────────────────────────────────────────────┐
+│  CloudWatch Logs (/ecs/payment-api)              │
+│    → Subscription Filter                         │
+│      → Kinesis Data Firehose                     │
+│        → Lambda (Python) ← gzip 해제 + domain 매핑│
+│          → S3 (도메인별 경로 파티셔닝)              │
+│            → Athena (Partition Projection)        │
+└──────────────────────────────────────────────────┘
+
+S3 경로:
+  seungjae/payment/2026/03/28/
+  seungjae/user/2026/03/29/
+  seungjae/order/2026/03/28/
 ```
 
 ## Athena DDL & Partition Projection
@@ -302,52 +302,19 @@ MIT
 
 **No log format restrictions** — Spring Boot text, Node.js JSON, any format works as-is.
 
-## Why S3 + Athena?
+## MCP Tools
 
-| Traditional | s3-logwatch |
-|---|---|
-| CloudWatch Logs Insights: **$0.005/GB scanned** | Athena: **$5/TB scanned** (1,000x cheaper) |
-| 30-day retention or expensive long-term storage | S3: **$0.023/GB/month** unlimited retention |
-| Separate dashboards needed | **Analyze from terminal with natural language** |
-| Log format fragmentation | **Unified queries** via domain-based partitioning |
-| Base cost even when idle | **$0 when not in use** |
-
-### Monthly Cost (1GB logs/day, no free tier)
-
-| Item | Cost |
-|---|---|
-| S3 storage + requests | ~$0.72 |
-| Firehose (with dynamic partitioning) | ~$3.87 |
-| Lambda | ~$0.002 |
-| Athena (10 queries/day) | ~$0.15 |
-| **Total** | **~$4.7/month** |
-
-## Architecture
-
-```
-User (Terminal)
-  │  Ask in natural language
-  v
-Claude Code
-  │  Auto-selects + calls MCP tools
-  v
-s3-logwatch MCP Server (TypeScript)
-  │
-  v
-┌──────────────────────────────────────────────────┐
-│  CloudWatch Logs (/ecs/payment-api)              │
-│    → Subscription Filter                         │
-│      → Kinesis Data Firehose                     │
-│        → Lambda (Python) ← gzip decode + domain  │
-│          → S3 (domain-based path partitioning)   │
-│            → Athena (Partition Projection)        │
-└──────────────────────────────────────────────────┘
-
-S3 paths:
-  seungjae/payment/2026/03/28/
-  seungjae/user/2026/03/29/
-  seungjae/order/2026/03/28/
-```
+| Tool | Description | Example |
+|---|---|---|
+| `init-infra` | Create all AWS resources (S3, Athena, Lambda, Firehose, IAM) | "Initialize infrastructure" |
+| `connect-log-group` | Connect CloudWatch Log Group → Firehose | "Connect payment-api, domain is payment" |
+| `disconnect-log-group` | Disconnect Log Group | "Disconnect payment-api" |
+| `destroy-infra` | Delete all AWS resources | "Destroy infrastructure" |
+| `athena-query` | Execute Athena SQL + results + cost (5min cache) | "Show payment errors" |
+| `get-cost` | View cumulative query costs | "How much did queries cost?" |
+| `update-config` | View/modify config (auto-updates Athena on domain change) | "Add billing domain" |
+| `set-alert` | Add/remove/list alert rules | "Alert on ERROR > 50" |
+| `check-alerts` | Check alert rules + threshold detection | "Check alerts" |
 
 ## Quick Start
 
@@ -420,20 +387,6 @@ Same queries are cached for 5 minutes (cost $0).
 > "Destroy all infrastructure"
 ```
 
-## MCP Tools
-
-| Tool | Description | Example |
-|---|---|---|
-| `init-infra` | Create all AWS resources (S3, Athena, Lambda, Firehose, IAM) | "Initialize infrastructure" |
-| `connect-log-group` | Connect CloudWatch Log Group → Firehose | "Connect payment-api, domain is payment" |
-| `disconnect-log-group` | Disconnect Log Group | "Disconnect payment-api" |
-| `destroy-infra` | Delete all AWS resources | "Destroy infrastructure" |
-| `athena-query` | Execute Athena SQL + results + cost (5min cache) | "Show payment errors" |
-| `get-cost` | View cumulative query costs | "How much did queries cost?" |
-| `update-config` | View/modify config (auto-updates Athena on domain change) | "Add billing domain" |
-| `set-alert` | Add/remove/list alert rules | "Alert on ERROR > 50" |
-| `check-alerts` | Check alert rules + threshold detection | "Check alerts" |
-
 ## Configuration
 
 `~/.s3-logwatch/config.yaml`:
@@ -471,6 +424,53 @@ alerts:
   rules: []
 ```
 
+## Why S3 + Athena?
+
+| Traditional | s3-logwatch |
+|---|---|
+| CloudWatch Logs Insights: **$0.005/GB scanned** | Athena: **$5/TB scanned** (1,000x cheaper) |
+| 30-day retention or expensive long-term storage | S3: **$0.023/GB/month** unlimited retention |
+| Separate dashboards needed | **Analyze from terminal with natural language** |
+| Log format fragmentation | **Unified queries** via domain-based partitioning |
+| Base cost even when idle | **$0 when not in use** |
+
+### Monthly Cost (1GB logs/day, no free tier)
+
+| Item | Cost |
+|---|---|
+| S3 storage + requests | ~$0.72 |
+| Firehose (with dynamic partitioning) | ~$3.87 |
+| Lambda | ~$0.002 |
+| Athena (10 queries/day) | ~$0.15 |
+| **Total** | **~$4.7/month** |
+
+## Architecture
+
+```
+User (Terminal)
+  │  Ask in natural language
+  v
+Claude Code
+  │  Auto-selects + calls MCP tools
+  v
+s3-logwatch MCP Server (TypeScript)
+  │
+  v
+┌──────────────────────────────────────────────────┐
+│  CloudWatch Logs (/ecs/payment-api)              │
+│    → Subscription Filter                         │
+│      → Kinesis Data Firehose                     │
+│        → Lambda (Python) ← gzip decode + domain  │
+│          → S3 (domain-based path partitioning)   │
+│            → Athena (Partition Projection)        │
+└──────────────────────────────────────────────────┘
+
+S3 paths:
+  seungjae/payment/2026/03/28/
+  seungjae/user/2026/03/29/
+  seungjae/order/2026/03/28/
+```
+
 ## Athena DDL & Partition Projection
 
 ```sql
@@ -500,8 +500,6 @@ TBLPROPERTIES (
 **Partition Projection**: New S3 folders are instantly recognized. No `MSCK REPAIR TABLE`.
 
 ## Lambda Transformer
-
-CloudWatch sends gzip-compressed data to Firehose. Lambda handles the transformation.
 
 ```
 CloudWatch (gzip) → Firehose → Lambda (Python 3.12) → S3
