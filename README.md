@@ -110,20 +110,31 @@ S3, Athena DB/테이블, Lambda, Firehose, IAM 역할이 자동 생성됩니다.
 `~/.s3-logwatch/config.yaml`:
 
 ```yaml
+region: ap-northeast-2              # AWS 리전 (변경 가능)
+
 s3:
-  bucket: s3-logwatch-logs
-  base_prefix: seungjae/
-  retention_days: 90              # 로그 보존 일수
+  bucket: s3-logwatch-logs-ap2      # S3 버킷 이름
+  base_prefix: seungjae/            # S3 루트 경로
+  retention_days: 90                # 로그 보존 일수
 
 firehose:
   delivery_stream: s3-logwatch-stream
-  buffer_interval: 300
-  buffer_size: 5
-  format: json                    # json | parquet
+  buffer_interval: 300              # 초
+  buffer_size: 5                    # MB
+  format: json                      # json | parquet
 
 athena:
-  workgroup: s3-logwatch
+  workgroup: s3-logwatch            # Athena 워크그룹 이름
   output_location: s3://s3-logwatch-logs-ap2/athena-results/
+  database: s3_logwatch             # Athena 데이터베이스 이름
+  table: logs                       # Athena 테이블 이름
+
+# IAM/Lambda 리소스 이름 (모두 변경 가능)
+resource_names:
+  firehose_role: s3-logwatch-firehose-role
+  lambda_role: s3-logwatch-lambda-role
+  lambda_function: s3-logwatch-transformer
+  cwl_to_firehose_role: s3-logwatch-cwl-to-firehose-role
 
 domains:
   - name: user
@@ -132,15 +143,13 @@ domains:
     s3_prefix: seungjae/order/
   - name: payment
     s3_prefix: seungjae/payment/
-  - name: auth
-    s3_prefix: seungjae/auth/
-  - name: notification
-    s3_prefix: seungjae/notification/
 
 alerts:
   webhook_url: https://hooks.slack.com/services/...
   rules: []
 ```
+
+모든 리소스 이름을 자유롭게 변경할 수 있습니다. 하드코딩 없음.
 
 ## 왜 S3 + Athena인가?
 
@@ -394,8 +403,10 @@ Same queries are cached for 5 minutes (cost $0).
 `~/.s3-logwatch/config.yaml`:
 
 ```yaml
+region: ap-northeast-2              # AWS region (configurable)
+
 s3:
-  bucket: s3-logwatch-logs
+  bucket: s3-logwatch-logs-ap2
   base_prefix: seungjae/
   retention_days: 90
 
@@ -403,11 +414,20 @@ firehose:
   delivery_stream: s3-logwatch-stream
   buffer_interval: 300
   buffer_size: 5
-  format: json                    # json | parquet
+  format: json                      # json | parquet
 
 athena:
   workgroup: s3-logwatch
   output_location: s3://s3-logwatch-logs-ap2/athena-results/
+  database: s3_logwatch             # Athena database name
+  table: logs                       # Athena table name
+
+# IAM/Lambda resource names (all configurable)
+resource_names:
+  firehose_role: s3-logwatch-firehose-role
+  lambda_role: s3-logwatch-lambda-role
+  lambda_function: s3-logwatch-transformer
+  cwl_to_firehose_role: s3-logwatch-cwl-to-firehose-role
 
 domains:
   - name: user
@@ -416,15 +436,13 @@ domains:
     s3_prefix: seungjae/order/
   - name: payment
     s3_prefix: seungjae/payment/
-  - name: auth
-    s3_prefix: seungjae/auth/
-  - name: notification
-    s3_prefix: seungjae/notification/
 
 alerts:
   webhook_url: https://hooks.slack.com/services/...
   rules: []
 ```
+
+All resource names are fully configurable. Zero hardcoding.
 
 ## Why S3 + Athena?
 
