@@ -25,6 +25,10 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { loadConfig } from "../config.js";
+import { readFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import { execSync } from "node:child_process";
 
 // =============================================================
 // AWS SDK v3 클라이언트 import
@@ -991,22 +995,47 @@ async function createLambdaFunction(
       domainMapping[conn.log_group] = conn.domain;
     }
 
-    // 플레이스홀더 코드 (실제 변환 로직은 src/lambda/transformer.ts에 있음)
-    const placeholderCode = Buffer.from(
-      'exports.handler = async (event) => { return { records: event.records.map(r => ({ recordId: r.recordId, result: "Ok", data: r.data })) }; };'
-    );
+    // Python Lambda 코드를 zip으로 패키징
+    // src/lambda/transformer.py를 읽어서 lambda_function.py로 zip 생성
+    // AWS Lambda Python은 핸들러가 lambda_function.handler 형태
+    const currentDir = dirname(fileURLToPath(import.meta.url));
+    const lambdaSourcePath = join(currentDir, "..", "lambda", "transformer.py");
+    const pythonCode = readFileSync(lambdaSourcePath, "utf-8");
 
-    const runtime: Runtime = "nodejs20.x" as Runtime;
+    // zip 파일 생성 (Node.js의 zlib으로는 zip 포맷을 만들 수 없으므로 시스템 zip 사용)
+    // 임시 디렉토리에 lambda_function.py를 작성하고 zip으로 압축
+    const tmpDir = join(currentDir, "..", "..", ".lambda-build");
+    execSync(`mkdir -p ${tmpDir}`);
+    const lambdaFilePath = join(tmpDir, "lambda_function.py");
+    const zipFilePath = join(tmpDir, "lambda.zip");
+
+    // Python 코드를 lambda_function.py로 작성
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(lambdaFilePath, pythonCode, "utf-8");
+
+    // zip 생성 (기존 zip 제거 후 새로 생성)
+    execSync(`cd ${tmpDir} && rm -f lambda.zip && zip lambda.zip lambda_function.py`);
+
+    // zip 파일 읽기
+    const zipBuffer = readFileSync(zipFilePath);
+
+    // 임시 파일 정리
+    execSync(`rm -rf ${tmpDir}`);
+
+    const runtime: Runtime = "python3.12" as Runtime;
 
     await lambda.send(
       new CreateFunctionCommand({
         FunctionName: LAMBDA_FUNCTION_NAME,
+        // Python 3.12 런타임 — gzip, base64, json 모두 표준 라이브러리
+        // 외부 의존성 없이 동작하므로 zip에 lambda_function.py만 포함
         Runtime: runtime,
         Role: roleArn,
-        Handler: "index.handler",
-        Code: { ZipFile: placeholderCode },
+        // Python Lambda 핸들러 형식: 파일명.함수명
+        Handler: "lambda_function.handler",
+        Code: { ZipFile: zipBuffer },
         Description:
-          "s3-logwatch: CloudWatch Logs gzip 해제 + logEvents 분리 + domain 매핑",
+          "s3-logwatch: CloudWatch Logs gzip decode + logEvents split + domain mapping",
         Timeout: 60,
         MemorySize: 128,
         Environment: {
