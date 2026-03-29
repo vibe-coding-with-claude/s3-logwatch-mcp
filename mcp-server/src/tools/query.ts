@@ -75,6 +75,22 @@ export interface QueryRecord {
 export const queryHistory: QueryRecord[] = [];
 
 // =============================================================
+// 쿼리 결과 캐시
+// =============================================================
+// 동일 SQL 쿼리의 반복 실행을 방지하여 Athena 비용을 절약합니다.
+// SQL 문자열을 키로 사용하며, TTL(5분) 이내의 캐시만 유효합니다.
+
+interface CacheEntry {
+  result: string;       // 포매팅된 결과 텍스트
+  scannedBytes: number;
+  cost: number;
+  cachedAt: number;     // Date.now()
+}
+
+const queryCache = new Map<string, CacheEntry>();
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5분
+
+// =============================================================
 // 폴링 설정 상수
 // =============================================================
 // 왜 상수로 분리하나?
@@ -211,6 +227,38 @@ export function registerQueryTool(server: McpServer): void {
  * 5. 결과를 테이블 형식 텍스트로 변환하고, 비용 정보를 추가합니다.
  */
 async function executeQuery(sql: string, region?: string) {
+  // 0단계: 캐시 확인 (lazy cleanup 포함)
+  // 만료된 엔트리를 정리한 후, 캐시 히트 여부를 확인합니다.
+  const now = Date.now();
+  for (const [key, entry] of queryCache) {
+    if (now - entry.cachedAt > CACHE_TTL_MS) {
+      queryCache.delete(key);
+    }
+  }
+
+  const cached = queryCache.get(sql);
+  if (cached && now - cached.cachedAt <= CACHE_TTL_MS) {
+    // 캐시 히트: Athena 호출을 스킵합니다.
+    // 비용이 $0이므로 queryHistory에는 추가하지 않습니다.
+    console.error(`[athena-query] 캐시 히트 (cached ${Math.round((now - cached.cachedAt) / 1000)}초 전)`);
+    const scannedMB = (cached.scannedBytes / (1024 * 1024)).toFixed(2);
+    const costStr = cached.cost.toFixed(6);
+    const resultText = [
+      cached.result,
+      "",
+      `Scanned: ${scannedMB} MB  Cost: $${costStr}  (cached)`,
+    ].join("\n");
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: resultText,
+        },
+      ],
+    };
+  }
+
   // 1단계: 설정 로드
   const config = loadConfig();
   const resolvedRegion = region ?? "us-east-1";
@@ -330,11 +378,19 @@ async function executeQuery(sql: string, region?: string) {
     timestamp: new Date().toISOString(),
   });
 
+  // 7.5단계: 결과를 캐시에 저장
+  queryCache.set(sql, {
+    result: tableText,
+    scannedBytes,
+    cost,
+    cachedAt: Date.now(),
+  });
+
   // 8단계: 최종 응답 구성
   const resultText = [
     tableText,
     "", // 빈 줄로 구분
-    `Scanned: ${scannedMB} MB  Cost: $${costStr}`,
+    `Scanned: ${scannedMB} MB  Cost: $${costStr}  (fresh)`,
   ].join("\n");
 
   return {
